@@ -1,0 +1,17 @@
+# build artifacts
+build/
+*.o
+*.d
+*.s
+*.hipfb
+# benchmark outputs (results are recorded in PROGRESS.md; raw jsonl is local)
+bench/results/
+# never commit weights or dumps
+*.gguf
+*.nsw
+*.bin
+dumps/
+# editor / os
+.cache/
+compile_commands.json
+*.swp
