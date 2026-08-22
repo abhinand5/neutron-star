@@ -26,6 +26,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string>
 #include <vector>
 
@@ -614,16 +617,58 @@ static double bench_wmma_gemm(int M, int N, int K, int reps) {
 }
 
 // ---------------------------------------------------------------------------
+// Display-attached guard.
+//
+// 2026-08-22: running this benchmark on a GPU that was also driving the desktop
+// hung the machine — sustaining 99% of DRAM bandwidth starves the display
+// controller, and the kernel logged "[CRTC:424:crtc-0] flip_done timed out"
+// before the box had to be power-cycled (DECISIONS.md D4). Saturating the
+// memory bus is the *point* of this benchmark, so it must never run on a GPU
+// with a live scanout.
+//
+// Returns the number of connected connectors on `pci`, or -1 if undeterminable.
+// ---------------------------------------------------------------------------
+static int connected_displays_for_pci(const char* pci) {
+    DIR* d = opendir("/sys/class/drm");
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        // connector dirs look like "card1-DP-3"; plain "card1" has no status file
+        if (strncmp(e->d_name, "card", 4) != 0 || !strchr(e->d_name, '-')) continue;
+        char link[PATH_MAX], real[PATH_MAX], status[PATH_MAX + 16];
+        snprintf(link, sizeof link, "/sys/class/drm/%s", e->d_name);
+        if (!realpath(link, real) || !strstr(real, pci)) continue;
+        snprintf(status, sizeof status, "%s/status", real);
+        FILE* f = fopen(status, "r");
+        if (!f) continue;
+        char buf[32] = {0};
+        if (fgets(buf, sizeof buf, f)) {
+            // NB: "disconnected" contains "connected" — match from the start
+            if (strncmp(buf, "connected", 9) == 0) {
+                n++;
+                printf("  !! %s is driving a display (%s)\n", pci, e->d_name);
+            }
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // device selection: PLAN §0.2 — never assume the device index. This machine
 // exposes the Raphael iGPU (gfx1036) as a HIP device too; pick by arch.
 // ---------------------------------------------------------------------------
-static int pick_gfx1201() {
+static int pick_gfx1201(char* pci_out, size_t pci_len) {
     int n = 0;
     HIP_CHECK(hipGetDeviceCount(&n));
     for (int i = 0; i < n; i++) {
         hipDeviceProp_t p;
         HIP_CHECK(hipGetDeviceProperties(&p, i));
         if (strncmp(p.gcnArchName, "gfx1201", 7) == 0) {
+            snprintf(pci_out, pci_len, "%04x:%02x:%02x.0", p.pciDomainID, p.pciBusID,
+                     p.pciDeviceID);
             printf("device %d: %s (%s)  %.1f GiB  %d CU-groups  %d MHz  wave%d  LDS %zu KB\n", i,
                    p.name, p.gcnArchName, p.totalGlobalMem / (1024.0 * 1024 * 1024),
                    p.multiProcessorCount, p.clockRate / 1000, p.warpSize,
@@ -639,6 +684,7 @@ int main(int argc, char** argv) {
     std::string which = "all";
     int nbuf = 8, nmat = 4, reps = 5, gemm_n = 4096;
     size_t buf_mib = 256;
+    bool allow_display = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? atoi(argv[++i]) : 0; };
@@ -647,14 +693,38 @@ int main(int argc, char** argv) {
         else if (a == "--mats") nmat = next();
         else if (a == "--reps") reps = next();
         else if (a == "--gemm-n") gemm_n = next();
+        else if (a == "--allow-display") allow_display = true;
         else if (a == "--help" || a == "-h") {
             printf("usage: membench [all|stream|gemv|dot|wmma] [--bufs N] [--buf-mib N]\n"
-                   "                [--mats N] [--reps N] [--gemm-n N]\n");
+                   "                [--mats N] [--reps N] [--gemm-n N] [--allow-display]\n"
+                   "\n"
+                   "  --allow-display  run even if the target GPU drives a monitor.\n"
+                   "                   DO NOT USE lightly: saturating memory bandwidth\n"
+                   "                   starves the display controller and has hung this\n"
+                   "                   machine before (DECISIONS.md D4).\n");
             return 0;
         } else which = a;
     }
-    const int dev = pick_gfx1201();
+    char pci[64] = {0};
+    const int dev = pick_gfx1201(pci, sizeof pci);
     HIP_CHECK(hipSetDevice(dev));
+
+    const int displays = connected_displays_for_pci(pci);
+    if (displays > 0 && !allow_display) {
+        fprintf(stderr,
+                "\nmembench: REFUSING TO RUN: the gfx1201 at %s has %d connected display(s).\n"
+                "This benchmark deliberately consumes ~99%% of DRAM bandwidth, which starves\n"
+                "the display controller; doing so on 2026-08-22 wedged the display pipe\n"
+                "(flip_done timed out) and the machine needed a hard power-cycle.\n"
+                "Move the monitor to another GPU, or pass --allow-display if you accept the\n"
+                "risk of losing the session. See DECISIONS.md D4.\n",
+                pci, displays);
+        return 3;
+    }
+    if (displays < 0)
+        printf("note: could not read /sys/class/drm; display-attach guard inactive\n");
+    else
+        printf("display guard: %s drives no monitors — safe to saturate\n", pci);
 
     const bool run_stream = which == "all" || which == "stream";
     const bool run_gemv   = which == "all" || which == "gemv";

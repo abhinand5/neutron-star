@@ -121,3 +121,57 @@ Type census by file, for planning (`ns inspect`):
 |---|---|---|
 | UD-Q4_K_XL | 9 | Q5_K 45.2%, IQ4_XS 17.8%, Q4_K 17.4%, Q6_K 16.3% |
 | UD-Q5_K_XL | 7 (no Q3_K, no IQ3_S) | Q6_K 48.1%, Q5_K 39.3%, Q8_0 8.8% |
+
+---
+
+## D4 — The R9700 must not drive a display; benchmarks refuse if it does
+
+**Date:** 2026-08-22 (Stage 0, after an incident)
+**Amends:** PLAN §0.3 ("Long GPU runs are fine") and §2.5.
+
+**Incident.** The Stage 0 microbenchmarks hung the machine; it needed a hard
+power-cycle, which also corrupted the git repo (zero-length `refs/heads/main`
+plus three empty objects — the work tree survived intact and was re-committed).
+
+**Evidence.** One single amdgpu error in that 6-hour boot, ~90 s after the
+benchmark sweep started:
+
+```
+Aug 22 22:16:51 kernel: amdgpu 0000:03:00.0: [drm] *ERROR* [CRTC:424:crtc-0] flip_done timed out
+```
+
+`0000:03:00.0` is the R9700, and at the time `card1-DP-3` on that card was the
+machine's only connected display. Everything run after 22:16 was CPU-only, so
+the card was already wedged; the kernel logged nothing further before the
+power-off at 22:26:52.
+
+**Mechanism (not speculation — the failure mode matches the workload exactly).**
+`membench` deliberately sustains ~99% of DRAM bandwidth (measured 634.8 of
+640 GB/s), because PLAN §0.1.2 requires a working set big enough to defeat the
+64 MB Infinity Cache. The display controller fetches scanout over that same
+memory bus. Starve it and page flips miss their deadline — which is precisely
+what `flip_done timed out` reports. A "long GPU run" and "a run that saturates
+the memory bus" are not the same risk, and §0.3 conflates them.
+
+**Resolution.** The monitor was moved to the iGPU's HDMI output. Verified:
+
+```
+card0-HDMI-A-2  status=connected enabled=enabled mode=2560x1440  pci=0000:7b:00.0  (iGPU)
+R9700 0000:03:00.0: DP-1/DP-2/DP-3/HDMI-A-1 all disconnected, SCLK 0 MHz, 0% load
+```
+
+The R9700 is now compute-only. This is the right configuration for the project
+regardless of the crash: PLAN §5.5 budgets ~30 GB of VRAM and §5.1 records a
+Q6_K_XL long-context collapse (13.68 t/s) caused by VRAM pressure — a desktop
+compositor on the same card was eating into that headroom.
+
+**Decision.** `bench/membench.hip` now hard-refuses to run when the target
+gfx1201 has any connected DRM connector, exit code 3, overridable only with an
+explicit `--allow-display`. Verified in both directions: it reports 0 connectors
+for the R9700 (runs) and finds `card0-HDMI-A-2` for the iGPU (would refuse).
+**Any future bandwidth-saturating tool (the Stage 2 decode engine included)
+must carry the same guard.**
+
+Side note: PLAN §0.2's warning that render-node numbering is inverted on this
+machine is re-verified and still true — `/dev/dri/renderD128` is the R9700
+(`0000:03:00.0`) even though `card0` is the iGPU.

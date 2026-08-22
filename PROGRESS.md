@@ -152,7 +152,91 @@ G0: GREEN
 `membench` exits non-zero if any gating criterion fails, so it doubles as a regression
 check — re-run it after any driver/ROCm update before trusting a perf comparison.
 
-**NEXT: Stage 1, task 1** — GGUF v3 reader (`src/gguf.{h,cpp}`): metadata + tensor
-directory + mmap, validating every tensor name/shape/type against the PLAN §4.1/§4.2
-inventory and hard-failing on surprises. Then `quants.h` (§5.3, six formats, bit-exact
-vs llama.cpp) and `cpu_ref.cpp`.
+### 7. Stage 1, task 1 — GGUF reader (done, same session)
+
+- `src/gguf.{h,cpp}` — GGUF v3 mmap reader, format only, no model knowledge. Every
+  read is bounds-checked against the mapping; a malformed file yields an error string,
+  never a segfault. Type table (blck/bytes) verified by compiling `ggml-common.h` at
+  the pinned commit and printing `sizeof(block_*)`; matches PLAN §5.3 exactly.
+- `src/loader.cpp` — metadata → `Config` (hard-fail on any missing key) and the §4.2
+  inventory contract: every expected tensor present, shape exact, type decodable, and
+  **nothing unexpected in the file**. Shapes are derived from `Config`, not hardcoded.
+- `src/main.cpp` — `ns inspect <model.gguf> [--kv] [--tensors]`.
+- `tests/test_gguf.cpp` — 99 checks: a synthetic valid file, 11 deliberately corrupt
+  ones (bad magic, bad version, truncation, absurd counts, unknown ggml type, offset
+  past EOF, unaligned offset, duplicate name, absurd string length, non-block-multiple
+  element count, non-power-of-two alignment) — all rejected with precise messages —
+  plus full validation of both blessed models. Skips (does not fail) if weights absent.
+
+Cross-checked against an **independently written** pure-stdlib Python GGUF parser
+(no numpy, no gguf-py, so agreement is evidence rather than a shared-source echo):
+all 866 tensors identical in name, dims, type, offset and byte size.
+
+Numbers produced by `ns inspect`, which **independently reproduce PLAN §5.1's roofline
+table to the digit** — the plan's math is confirmed by the actual files:
+
+| File | tensors | GiB | streamed/token | ceiling | PLAN §5.1 says |
+|---|---|---|---|---|---|
+| UD-Q4_K_XL | 866 | 16.343 | 16.83 GB | 38.0 t/s | 16.83 GB / 38.0 |
+| UD-Q5_K_XL | 866 | 19.433 | 19.82 GB | 32.3 t/s | 19.82 GB / 32.3 |
+| AD-Q6_K | 866 | 23.278 | 23.64 GB | 27.1 t/s | 23.64 GB / 27.1 |
+| UD-Q6_K_XL | 866 | 23.551 | 24.25 GB | 26.4 t/s | 24.25 GB / 26.4 |
+| UD-Q6_K_M | 866 | 21.493 | 22.03 GB | 29.0 t/s | (was unbenched) |
+
+All five files pass full inventory validation; `mmproj-BF16.gguf` is rejected cleanly
+("architecture 'clip'"). Both blessed files have **zero slack**: `data_offset +
+tensor_bytes == filesize` exactly. New refinement the plan did not have: excluding the
+MTP block (only streamed on draft steps) gives **16.48 GB → 38.8 t/s** for plain
+Q4_K_XL decode.
+
+Two corrections to PLAN §4.2/§5.2, which understate how heterogeneous the Aug-19
+Unsloth mixes are (recorded because Stage 2 kernel work is planned against this):
+
+- `ssm_alpha.weight` / `ssm_beta.weight` are **Q8_0** in both files, not Q4_K/Q5_K.
+- Types vary per *tensor*, not per role: in Q4_K_XL, `ffn_gate` spans IQ4_NL, IQ4_XS,
+  Q3_K, Q4_K, Q5_K and Q6_K; `attn_qkv` spans five types. The loader must be fully
+  type-generic per tensor. Union of types across both blessed files is exactly the
+  nine PLAN §5.3 lists (F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ4_NL, IQ4_XS) —
+  no surprise formats.
+
+### 8. INCIDENT — machine hang and hard power-cycle (root-caused, fixed)
+
+The Stage 0 benchmark sweep hung the desktop; it required holding the power button.
+Full analysis in `DECISIONS.md` **D4**. Summary:
+
+- One amdgpu error in the whole 6-hour boot, ~90 s into the sweep:
+  `amdgpu 0000:03:00.0: [drm] *ERROR* [CRTC:424:crtc-0] flip_done timed out`.
+- `0000:03:00.0` is the R9700, and it was also driving the machine's only monitor
+  (`card1-DP-3`). `membench` sustains ~99% of DRAM bandwidth by design (§0.1.2
+  requires a working set that defeats the 64 MB Infinity Cache); the display
+  controller fetches scanout over that same bus and missed its page-flip deadline.
+- Everything run after 22:16 was CPU-only, so the card was already wedged.
+- **PLAN §0.3's "long GPU runs are fine" is wrong as written** — a long run and a
+  bandwidth-saturating run are different risks. Amended by D4.
+
+Fixes, both verified:
+
+1. Monitor moved to the iGPU (`card0-HDMI-A-2`, 2560x1440, `0000:7b:00.0`). The R9700
+   now reports no connected connectors, SCLK 0 MHz. This is the right configuration
+   anyway — §5.5 budgets ~30 GB of VRAM and §5.1 blames a Q6_K_XL long-context
+   collapse on VRAM pressure; a compositor on the compute card was eating that.
+2. `membench` gained a display-attach guard: it refuses to run (exit 3) if the target
+   gfx1201 has any connected DRM connector, overridable only via `--allow-display`.
+   Verified in both directions — 0 connectors for the R9700 (runs), finds
+   `card0-HDMI-A-2` for the iGPU (would refuse). **Every future bandwidth-saturating
+   tool, the Stage 2 decode engine included, must carry this guard.**
+
+Collateral: the power-cycle corrupted git (`refs/heads/main` and 3 objects
+zero-length). Work tree was intact and tests passed; empty objects and the dead ref
+were removed and everything re-committed. `git fsck` clean.
+
+G0 re-run on the now-headless card, confirming the numbers were not a fluke and the
+fix works: read **634.5 GB/s** (was 634.8), GEMV proxy **625.7** (was 624.1), WMMA
+**35.6 TFLOPS** (was 35.7), int dot exact. G0: GREEN. No kernel errors during or
+after the run; GPU idle at 38 °C.
+
+**NEXT: Stage 1, task 2** — `src/quants.h`: port the dequant functions for the nine
+formats from `ggml-quants.c` (`dequantize_row_q4_K/_q5_K/_q6_K/_iq4_xs/_q3_K/_iq3_s/
+_iq4_nl/_q8_0`), bit-exact. `get_scale_min_k4` is the classic off-by-one trap — copy
+it, do not re-derive. Golden-value unit tests per format against llama.cpp. Then
+`cpu_ref.cpp` (§4.3 forward pass) and the oracle chain (§9.1). All CPU-only work.
