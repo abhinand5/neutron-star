@@ -19,7 +19,7 @@ else
   BUILDDIR := build/release
 endif
 
-FLAGS := $(ARCH) $(OPT) $(WARN) -Isrc
+FLAGS := $(ARCH) $(OPT) $(WARN) -Isrc -Itests
 
 # ---- sources -----------------------------------------------------------------
 SRCS   := $(wildcard src/*.cpp) $(wildcard src/kernels/*.hip)
@@ -33,6 +33,13 @@ TESTBINS := $(patsubst tests/%,$(BUILDDIR)/tests/%,$(basename $(TESTSRCS)))
 BENCHSRCS := $(wildcard bench/*.hip)
 BENCHBINS := $(patsubst bench/%.hip,$(BUILDDIR)/%,$(BENCHSRCS))
 
+# Oracle tools link llama.cpp's ggml (PLAN §9.1). Not part of `all` or `test`:
+# ns itself depends on the HIP runtime only (§3.4).
+LLAMA_DIR   ?= $(HOME)/dev/inference-engines/llama.cpp
+GGML_LIBDIR := $(LLAMA_DIR)/build_vulkan/bin
+TOOLSRCS    := $(wildcard tools/*.cpp)
+TOOLBINS    := $(patsubst tools/%.cpp,$(BUILDDIR)/tools/%,$(TOOLSRCS))
+
 # ---- top level ---------------------------------------------------------------
 ifeq ($(strip $(SRCS)),)
 all: bench
@@ -41,7 +48,7 @@ else
 all: $(NS)
 endif
 
-.PHONY: all bench test debug clean help
+.PHONY: all bench test tools debug clean help
 debug:
 	@$(MAKE) --no-print-directory MODE=debug all bench test
 
@@ -82,6 +89,13 @@ test: $(TESTBINS)
 	done; exit $$fail
 endif
 
+tools: $(TOOLBINS)
+
+$(BUILDDIR)/tools/%: tools/%.cpp $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))
+	@mkdir -p $(dir $@)
+	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) \
+	  -L$(GGML_LIBDIR) -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@
+
 clean:
 	rm -rf build
 
@@ -90,6 +104,7 @@ help:
 	@echo "make debug      -O1 -g -DNS_DEBUG build of everything"
 	@echo "make bench      build bench/*.hip -> $(BUILDDIR)/"
 	@echo "make test       build+run tests/"
+	@echo "make tools      build tools/ (links llama.cpp ggml; oracle checks)"
 	@echo "make clean"
 
 -include $(DEPS)
