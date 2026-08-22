@@ -7,6 +7,7 @@
 #include "ns.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <map>
 #include <set>
@@ -20,12 +21,81 @@ static const double GiB = 1024.0 * 1024.0 * 1024.0;
 // PLAN §2.1 spec peak; Stage 0 measured 634.8 GB/s of it (PROGRESS 2026-08-22).
 static const double PEAK_BW = 640.0 * GB;
 
+static double now_sec() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
 static int usage() {
     fprintf(stderr,
             "usage: ns inspect <model.gguf> [--kv] [--tensors]\n"
             "  --kv        dump every metadata key\n"
-            "  --tensors   dump every tensor (name, shape, type, offset)\n");
+            "  --tensors   dump every tensor (name, shape, type, offset)\n"
+            "\n"
+            "       ns eval <model.gguf> --tokens a,b,c [--topk N] [--all-pos]\n"
+            "                            [--dump-logits FILE]\n"
+            "  runs the CPU reference forward pass (PLAN §4.3) over a token\n"
+            "  sequence and prints the top-k predictions. Slow by design.\n");
     return 2;
+}
+
+static int cmd_eval(const std::string& path, const std::string& tokens_csv, int topk,
+                    bool all_pos, const std::string& dump_path, int debug_pos = -1) {
+    std::vector<int32_t> tokens;
+    {
+        size_t p = 0;
+        while (p <= tokens_csv.size()) {
+            const size_t e = tokens_csv.find(',', p);
+            const std::string piece = tokens_csv.substr(p, e == std::string::npos ? e : e - p);
+            if (!piece.empty()) tokens.push_back((int32_t)strtol(piece.c_str(), nullptr, 10));
+            if (e == std::string::npos) break;
+            p = e + 1;
+        }
+    }
+    if (tokens.empty()) { fprintf(stderr, "ns: --tokens is empty\n"); return 2; }
+
+    RefModel m;
+    std::string err;
+    const double t_load0 = now_sec();
+    if (!m.load(path, &err)) { fprintf(stderr, "ns: %s\n", err.c_str()); return 1; }
+    printf("loaded %s in %.2f s (%zu layers, vocab %u)\n", m.cfg.name.c_str(),
+           now_sec() - t_load0, m.layers.size(), m.cfg.n_vocab);
+
+    if (debug_pos >= 0) ref_set_debug_pos(debug_pos);
+    RefState st;
+    st.reset(m.cfg);
+    std::vector<float> logits;
+    FILE* dump = dump_path.empty() ? nullptr : fopen(dump_path.c_str(), "wb");
+    if (!dump_path.empty()) NS_CHECK(dump, "cannot write %s", dump_path.c_str());
+
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const double t0 = now_sec();
+        ref_forward(m, st, tokens[i], (int32_t)i, logits);
+        const double dt = now_sec() - t0;
+        if (dump) NS_CHECK(fwrite(logits.data(), sizeof(float), logits.size(), dump) ==
+                               logits.size(), "short write to %s", dump_path.c_str());
+        if (!all_pos && i + 1 != tokens.size()) {
+            printf("  pos %3zu token %6d  %.2f s\n", i, tokens[i], dt);
+            continue;
+        }
+        // top-k without sorting the whole 248320-entry vector
+        std::vector<int> idx(logits.size());
+        for (size_t j = 0; j < idx.size(); j++) idx[j] = (int)j;
+        const int kk = std::min<int>(topk, (int)idx.size());
+        std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
+                          [&](int a, int b) { return logits[a] > logits[b]; });
+        double sum = 0.0;
+        const float mx = logits[idx[0]];
+        for (float l : logits) sum += exp((double)(l - mx));
+        printf("  pos %3zu token %6d  %.2f s  top%d:", i, tokens[i], dt, kk);
+        for (int j = 0; j < kk; j++)
+            printf(" [%d]=%.4f(p=%.3f)", idx[j], logits[idx[j]],
+                   exp((double)(logits[idx[j]] - mx)) / sum);
+        printf("\n");
+    }
+    if (dump) { fclose(dump); printf("logits written to %s\n", dump_path.c_str()); }
+    printf("L2-norm eps floor bound %" PRId64 " times\n", ref_l2_eps_hits());
+    return 0;
 }
 
 static std::string suffix_of(const std::string& name) {
@@ -129,6 +199,22 @@ static int cmd_inspect(const std::string& path, bool dump_kv, bool dump_tensors)
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string cmd = argv[1];
+    if (cmd == "eval") {
+        if (argc < 3) return usage();
+        std::string tokens, dump;
+        int topk = 5, debug_pos = -1;
+        bool all_pos = false;
+        for (int i = 3; i < argc; i++) {
+            const std::string a = argv[i];
+            if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
+            else if (a == "--topk" && i + 1 < argc) topk = atoi(argv[++i]);
+            else if (a == "--dump-logits" && i + 1 < argc) dump = argv[++i];
+            else if (a == "--all-pos") all_pos = true;
+            else if (a == "--debug-pos" && i + 1 < argc) debug_pos = atoi(argv[++i]);
+            else return usage();
+        }
+        return cmd_eval(argv[2], tokens, topk, all_pos, dump, debug_pos);
+    }
     if (cmd == "inspect") {
         if (argc < 3) return usage();
         bool kv = false, tens = false;

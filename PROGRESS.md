@@ -240,3 +240,132 @@ formats from `ggml-quants.c` (`dequantize_row_q4_K/_q5_K/_q6_K/_iq4_xs/_q3_K/_iq
 _iq4_nl/_q8_0`), bit-exact. `get_scale_min_k4` is the classic off-by-one trap — copy
 it, do not re-derive. Golden-value unit tests per format against llama.cpp. Then
 `cpu_ref.cpp` (§4.3 forward pass) and the oracle chain (§9.1). All CPU-only work.
+
+---
+
+## 2026-08-22 — Session 2 (Stage 1 tasks 2–5, Claude Opus 5)
+
+Continues session 1 (same day). **Stage 1 is not complete: gate G1 is RED** with a
+precisely characterised open bug (DECISIONS.md D7). Everything else landed.
+
+### 1. Stage 1 task 2 — dequantization, bit-exact vs llama.cpp
+
+`src/quants.h` + `src/quants.cpp`: block layouts and CPU dequant for all nine formats
+present in the blessed files (Q3_K Q4_K Q5_K Q6_K Q8_0 IQ3_S IQ4_NL IQ4_XS, plus
+F32/F16/BF16), ported literally from `ggml-quants.c` @ 3cb7ffb1a with `static_assert`
+on every struct size. The constant tables (`kvalues_iq4nl`, `kmask_iq2xs`, the
+512-entry `iq3s_grid`) are **machine-extracted** by `tools/extract_ggml_tables.py`
+rather than transcribed — with per-table checksums and the source commit recorded,
+since a one-entry typo in a 512-entry grid would surface as garbage tokens many
+stages later.
+
+`tools/quant_oracle.cpp` links `libggml-base.so` and compares directly:
+
+```
+$ make tools && ./build/release/tools/quant_oracle
+  Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/IQ3_S/IQ4_NL/IQ4_XS: 4096 random blocks each -> bit-exact
+  Q4_K_XL: 506 quantized tensors, 2485248 elements compared: bit-exact
+  Q5_K_XL: 506 quantized tensors, 2404608 elements compared: bit-exact
+  QUANT ORACLE: ns dequant is BIT-EXACT vs llama.cpp
+```
+
+32768 fuzz blocks + 4.89M elements over 1012 real tensors, zero mismatches.
+`tests/test_quants.cpp` keeps `make test` self-contained (no llama.cpp, no weights
+needed) using `tests/golden_quants.h` — real blocks of all 8 quant formats paired
+with the exact float bits llama.cpp produced. 3.47M checks.
+
+### 2. Stage 1 task 3 — `src/cpu_ref.cpp`, the fp32 CPU forward pass
+
+Full §4.3 decode: embedding gather, 48 gated-deltanet layers, 16 full-attention
+layers, MRoPE, GQA, SwiGLU FFN, final norm and lm_head. Weights stay quantized in the
+mmap and are dequantized a row at a time inside each matvec, so a step streams the
+whole model — **3.67 s/token** with OpenMP over output rows (PLAN allowed minutes).
+
+It works end to end:
+
+```
+$ ns eval Qwen3.8-27B-UD-Q4_K_XL.gguf --tokens 760,6511,314,9338,369 --all-pos
+  "The capital of France is"
+  pos 1 -> 314 'Ġof'      pos 3 -> 369 'Ġis'      pos 4 -> 11751 'ĠParis' (p=0.62)
+```
+
+Before writing a line of it, all four semantics PLAN §4.3 flags as "verify" were
+checked against the pinned llama.cpp source. **Two were wrong in the plan** — the GQA
+mapping is `i/6` not `i%4`, and the L2-norm epsilon floors the norm rather than
+sitting under the root. Both are the kind of error that yields plausible-but-degraded
+output. Full write-up in DECISIONS.md **D5**.
+
+### 3. Stage 1 tasks 4–5 — oracle and comparison harness
+
+`tools/oracle_logits.cpp` links libllama and dumps per-position logits in the same
+raw-fp32 format `ns eval --dump-logits` writes. Making it an honest oracle took three
+fixes, each caught by reading its own output rather than trusting defaults:
+
+- it was silently scheduling ops on **Vulkan** (`graph splits = 161`) despite
+  `n_gpu_layers=0` — now pins `mp.devices` to the CPU device (`graph splits = 1`);
+- it defaulted to **f16 KV** while cpu_ref uses fp32 — now `type_k/type_v = F32`;
+- it **prefilled in one batch**, exercising llama.cpp's chunked GDN kernels, while ns
+  decodes stepwise — now one `llama_decode` per token by default.
+
+`tools/compare.py` reports top-1 agreement, top-k overlap, cosine, max-abs-diff and
+greedy-identity per position.
+
+### 4. The G1 gate as written is unreachable — now self-calibrating (D6)
+
+PLAN §9.2 demands cosine ≥ 0.9999. **llama.cpp cannot meet that against itself:**
+
+| comparison (same weights, same tokens) | worst cosine |
+|---|---|
+| llama.cpp CPU batched vs **itself** stepwise | 0.99951 |
+| llama.cpp GPU-allowed vs **itself** CPU-only | 0.99946 |
+
+Two runs in the same configuration are bit-identical (`cmp`), so this is arithmetic
+ordering, not nondeterminism. `tools/compare.py` gained `--control FILE`: the cosine
+bar becomes `min(configured, control_worst)` — *ns must match llama.cpp at least as
+well as llama.cpp matches itself*. It is not a loosened constant and it did not
+rubber-stamp ns.
+
+### 5. G1 result: RED, with a real bug
+
+205 positions across 4 prompts (prose, Python, literary, technical):
+
+| prompt | positions | top-1 | worst cos (ns) | worst cos (control) | verdict |
+|---|---|---|---|---|---|
+| p1 prose | 31 | 1.000 | 0.99951 | 0.99940 | GREEN |
+| p2 code | 90 | 1.000 | 0.98601 | 0.99599 | RED |
+| p3 literary | 54 | 1.000 | 0.99873 | 0.99801 | GREEN |
+| p4 technical | 30 | **0.933** | **0.95580** | 0.99905 | RED |
+
+**ns is the outlier, confirmed by triangulation** — at p4 positions 19 and 25,
+llama.cpp's two independent code paths agree with each other (0.9997, 0.9998) while
+ns disagrees with both (0.9558, 0.9684).
+
+Eight hypotheses were tested and eliminated with evidence (table in D7), including
+the two that looked most promising: the L2-norm eps floor **never binds** (0 hits,
+instrumented), and switching every dot product to `double` moved the result by
+**1e-6** — proving the divergence is structural, not numerical noise. Per-layer
+statistics from `ns eval --debug-pos 19` are entirely healthy: no non-finite values,
+rms growing smoothly 0.21 → 8.83 across 64 layers.
+
+An earlier 5-position spot check looked perfect (top-1 100%, greedy identical); that
+was too small a sample and did not survive 205 positions. Recorded so the next
+session does not repeat the mistake.
+
+### Commands worth keeping
+
+```
+make && make test                 # engine + 3.5M self-contained checks
+make tools                        # oracle tools (need llama.cpp built)
+./build/release/tools/quant_oracle            # dequant bit-exactness
+./build/release/ns eval MODEL --tokens ... --dump-logits ns.bin
+./build/release/tools/oracle_logits -m MODEL -t ... -o ref.bin
+python3 tools/compare.py ns.bin ref.bin --control ref_batch.bin --vocab 248320
+./build/release/ns eval MODEL --tokens ... --debug-pos 19    # per-layer stats
+```
+
+**NEXT: close D7, then G1.** Layer-bisect p4 position 19 — dump per-layer activations
+from llama.cpp via `llama-eval-callback` (the graph already tags `attn_norm`,
+`linear_attn_out`, `ffn_out`, `l_out`) and from ns via `--debug-pos`, and find the
+first layer whose cosine drops. Element-wise comparison is required; summary
+statistics were not sufficient. Stage 2 stays blocked behind G1 (PLAN §0.3: do not
+start the next stage until the gate is green).

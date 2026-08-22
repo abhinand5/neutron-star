@@ -175,3 +175,183 @@ must carry the same guard.**
 Side note: PLAN §0.2's warning that render-node numbering is inverted on this
 machine is re-verified and still true — `/dev/dri/renderD128` is the R9700
 (`0000:03:00.0`) even though `card0` is the iGPU.
+
+---
+
+## D5 — PLAN §4.3 forward-pass semantics: verified, with two corrections
+
+**Date:** 2026-08-22 (Stage 1, before writing cpu_ref)
+**Amends:** PLAN §4.3.
+
+§4.3 flags four details as "verify against llama.cpp". All four are now resolved
+against the pinned source. Two of them were wrong in the plan, and both would have
+produced *plausible but subtly incorrect* output — the expensive kind of bug.
+
+### CORRECTION 1 — GQA head mapping is `i / 6`, not `i % 4`
+
+§4.3 B.5 says "q-head i uses kv-head `i mod 4`... **verify:** llama.cpp GQA
+convention is `i / (24/4) = i / 6`". The verification stands: ggml broadcasts
+`mul_mat` operands by integer division, `ggml-cpu.c:1307`:
+
+```c
+(const char *)src0->data + i12/r2*nb02 + ...     // r2 = ne12/ne02 = n_head/n_head_kv = 6
+```
+
+So **q-head i attends with kv-head `i / 6`** — heads 0–5 share kv-head 0, and so on.
+`i % 4` would interleave them and silently degrade quality.
+
+### CORRECTION 2 — L2-norm epsilon is a floor on the norm, not a term under the root
+
+§4.3 A.5 writes `q = q / sqrt(Σ q² + eps)`. The actual op
+(`ggml_compute_forward_l2_norm_f32`, ops.cpp) is:
+
+```c
+const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+```
+
+i.e. **`q / max(sqrt(Σ q²), eps)`**, with `eps = f_norm_rms_eps = 1e-6`
+(`qwen35.cpp:430`). These agree to ~1e-12 for normal vectors and diverge only for
+near-zero ones, which is exactly the case that would go unnoticed until a rare token
+produced garbage. Implemented as ggml does it.
+
+### CONFIRMED — GDN head broadcast is `h % 16` (tile-repeat)
+
+§4.3 A.6 is right. `qwen35.cpp:444` calls `ggml_repeat_4d(q_conv, head_k_dim,
+num_v_heads, ...)`, and `ggml_repeat` tiles rather than block-repeats, so v-head `h`
+uses k/q-head `h % 16`, not `h / 3`.
+
+### CONFIRMED — delta rule, state layout, and MRoPE pairing
+
+- `build_delta_net_autoregressive` matches §4.3 A.7 step for step, including the
+  order (decay → error against the *decayed* state → rank-1 update → output from the
+  *updated* state) and `q̂ = q/sqrt(128)`. State index convention also matches:
+  ggml `ne[0]` is the k-dim `j`, `ne[1]` the v-dim `r`, i.e. PLAN's `S[j][r]`.
+- MRoPE dispatches to `rotate_pairs(n_dims, n_dims/2, ...)` — the same path as
+  `GGML_ROPE_TYPE_NEOX`. With all three text position streams equal, §4.3 B.4's
+  reduction holds exactly: 32 pairs, element `p` paired with `p+32`,
+  `theta_p = pos · freq_base^(-2p/64)`, dims 64–255 copied through untouched.
+- Attention output gating is `attn * sigmoid(gate)` then `W_o` (§4.3 B.7–8) and the
+  GDN gated norm is `RMSNorm(o, ssm_norm) * SiLU(z)` (§4.3 A.8) — both as written.
+- Depthwise conv tap 0 multiplies the *oldest* window element and tap 3 the current
+  token (`ggml_compute_forward_ssm_conv_f32`); conv weight element index is
+  `channel*4 + tap`.
+- `softplus(x) = (x > 20) ? x : log(1 + exp(x))` (`unary-ops.cpp:80`) — the guard
+  matters, ns copies it.
+
+### Accumulator precision (matched to ggml deliberately)
+
+RMSNorm and L2-norm sum in double (`ggml_float`); ssm_conv and quantized dot
+products accumulate in float; softmax is float with max subtraction. cpu_ref follows
+each of these so that any parity gap is a real bug rather than an arithmetic
+difference we chose.
+
+---
+
+## D6 — G1 parity: the cosine ≥ 0.9999 gate is not reachable; the gate is now self-calibrating
+
+**Date:** 2026-08-22 (Stage 1)
+**Amends:** PLAN §8 Stage 1 gate G1 / §9.2.
+
+§9.2 requires per-position cosine ≥ 0.9999 against llama.cpp. Measured on this
+model, **no implementation can meet that**, because llama.cpp does not meet it
+against itself:
+
+| Comparison (Q4_K_XL, same weights, same tokens) | worst cosine | mean |
+|---|---|---|
+| llama.cpp CPU batched-prefill **vs itself** stepwise-decode | 0.99951 | 0.99974 |
+| llama.cpp GPU-allowed **vs itself** CPU-only | 0.99946 | 0.99973 |
+| ns vs llama.cpp CPU stepwise (5-token prompt) | 0.99968 | 0.99981 |
+
+Two runs of llama.cpp in the *same* configuration are bit-identical (verified with
+`cmp`), so this spread is arithmetic ordering between backends and code paths, not
+nondeterminism. A 64-layer model with heterogeneous per-tensor quantization and a
+248320-wide output simply does not reproduce to 1e-4 across implementations.
+
+**Decision.** `tools/compare.py` gained `--control FILE`, taking a second independent
+run of the reference engine. The cosine bar becomes
+`min(configured, control_worst_cosine)` — *ns must match llama.cpp at least as well
+as llama.cpp matches itself*. This is objective and cannot be gamed by loosening a
+constant, and it did not rubber-stamp ns: see below.
+
+The criteria that actually govern output quality are unchanged and remain absolute:
+**top-1 agreement ≥ 99.5%, top-5 overlap, and identical greedy continuations.**
+
+**Status: G1 is RED.** Over 205 positions across 4 prompts (prose, Python, literary
+prose, technical prose):
+
+| prompt | positions | top-1 | worst cos (ns) | worst cos (control) | verdict |
+|---|---|---|---|---|---|
+| p1 prose | 31 | 1.000 | 0.99951 | 0.99940 | GREEN |
+| p2 code | 90 | 1.000 | 0.98601 | 0.99599 | RED |
+| p3 literary | 54 | 1.000 | 0.99873 | 0.99801 | GREEN |
+| p4 technical | 30 | **0.933** | **0.95580** | 0.99905 | RED |
+
+ns fails on its own merits, not because of a threshold. See the open bug below.
+
+---
+
+## D7 — OPEN BUG: cpu_ref diverges transiently at isolated positions
+
+**Date:** 2026-08-22 (Stage 1) · **Status: open, precise repro in hand**
+
+**Repro.** Prompt p4 ("Memory bandwidth is the fundamental limit on single-stream
+transformer decoding, because every weight must be read from DRAM once per generated
+token regardless of batch size."), positions **19** and **25**.
+
+**ns is the outlier, not llama.cpp** — triangulated against llama.cpp's two
+independent code paths, which agree with each other exactly where ns disagrees with
+both:
+
+| pos | ns vs stepwise | ns vs batched | stepwise vs batched |
+|---|---|---|---|
+| 18 | 0.999818 | 0.999799 | 0.999784 |
+| **19** | **0.955803** | **0.955729** | 0.999742 |
+| 20 | 0.999482 | 0.999508 | 0.999547 |
+| **25** | **0.968417** | **0.968443** | 0.999849 |
+
+**What the evidence rules out.**
+
+- *Not* a bad dequantized weight row: the largest single-logit error at both
+  positions lands on the same vocab index 53983, but in **opposite directions**
+  (ns −18.57 vs ref −3.69 at pos 19; ns −7.47 vs ref −16.88 at pos 25) and that index
+  is correct to ~0.03 at the other 28 positions.
+- *Not* accumulated recurrent-state drift: position 20 recovers to 0.9995 immediately
+  after the pos-19 excursion. A corrupted GDN state or KV entry would persist.
+- *Not* KV-cache precision: the oracle was rerun with `type_k/type_v = F32` to match
+  cpu_ref and produced bit-identical logits to the f16 run.
+- *Not* the prefill/decode path difference: the oracle was rerun stepwise (one
+  `llama_decode` per token) and it barely moved (0.99965 → 0.99968).
+
+**The divergence is STRUCTURAL, not numerical.** Rebuilding cpu_ref with the matvec
+dot product accumulated in `double` instead of `float` moved the worst cosine from
+0.95580331 to 0.95580**438** — a change of 1e-6. If position 19 were a chaotic
+knife-edge amplifying rounding noise, perturbing every dot product in the model would
+have moved it substantially. It did not. ns robustly computes one value and llama.cpp
+robustly computes another (llama.cpp's own two code paths agree there at 0.9997), so
+there is a genuine algorithmic difference that only manifests at some positions.
+
+**Hypotheses eliminated, with evidence:**
+
+| # | Hypothesis | Killed by |
+|---|---|---|
+| 1 | L2-norm eps floor knife-edge (`q/max(‖q‖,eps)`) | instrumented counter: the floor bound **0 times** in the whole run |
+| 2 | NaN/Inf leaking through a layer | per-layer scan: **0** non-finite values, rms grows smoothly 0.21 → 8.83 over 64 layers |
+| 3 | Accumulator precision (naive float sum over k≤17408) | switching the dot to `double` changed the result by **1e-6** |
+| 4 | KV-cache precision (f16 oracle vs fp32 ns) | oracle rerun with `type_k/v = F32`: **bit-identical** logits |
+| 5 | Prefill vs decode code path | oracle rerun stepwise: 0.99965 → 0.99968, immaterial |
+| 6 | GDN head broadcast wrong (`h%16` vs `h/3`) | the **fused** op llama.cpp actually runs (`fused_gdn_ar=true`) uses `iv1 % nek1` in `ops.cpp:10818` — modulo, matching ns. Note llama.cpp's own header carries `TODO ... broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]`, so this deserved checking |
+| 7 | A mis-dequantized lm_head row | the worst index (53983) errs in **opposite directions** at the two positions and is correct to ~0.03 at the other 28 |
+| 8 | Accumulated recurrent-state drift | position 20 recovers to 0.9995 immediately after the pos-19 excursion |
+
+**Context that may matter:** the two divergent positions carry rare subword tokens —
+pos 19 is `ĠDR` (the split of "DRAM"), pos 25 is `Ġregardless` — and the worst-hit
+output index 53983 is `alyze`. Rare-token rows are the least-well-conditioned part of
+a heavily quantized model, so the trigger may be data-dependent rather than a plain
+logic error.
+
+**Next step (PLAN §8 Stage 1 / §10):** layer-bisect position 19 properly — dump
+per-layer activations from llama.cpp via `llama-eval-callback` (cb names
+`attn_norm`, `linear_attn_out`, `ffn_out`, `l_out` are already in the graph) and from
+ns via `ns eval --debug-pos 19`, then find the first layer whose cosine drops. That
+layer is the bug's home. Statistics alone were not enough: ns's per-layer rms/min/max
+look entirely healthy, so the comparison has to be element-wise against the oracle.

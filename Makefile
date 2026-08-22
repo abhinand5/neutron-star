@@ -19,7 +19,7 @@ else
   BUILDDIR := build/release
 endif
 
-FLAGS := $(ARCH) $(OPT) $(WARN) -Isrc -Itests
+FLAGS := $(ARCH) $(OPT) $(WARN) -Isrc -Itests -fopenmp
 
 # ---- sources -----------------------------------------------------------------
 SRCS   := $(wildcard src/*.cpp) $(wildcard src/kernels/*.hip)
@@ -90,6 +90,11 @@ test: $(TESTBINS)
 endif
 
 tools: $(TOOLBINS)
+
+$(BUILDDIR)/tools/oracle_logits: tools/oracle_logits.cpp
+	@mkdir -p $(dir $@)
+	$(HIPCC) $(FLAGS) -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include $< \
+	  -L$(GGML_LIBDIR) -lllama -lggml -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@
 
 $(BUILDDIR)/tools/%: tools/%.cpp $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))
 	@mkdir -p $(dir $@)

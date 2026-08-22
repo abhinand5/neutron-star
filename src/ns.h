@@ -124,4 +124,74 @@ struct InventoryStats {
 // any surprise; returns the byte census on success.
 InventoryStats validate_inventory(const GgufFile& f, const Config& c);
 
+// ---------------------------------------------------------------------------
+// CPU reference forward pass (src/cpu_ref.cpp)
+//
+// The in-repo oracle: full fp32 decode per PLAN §4.3, semantics verified against
+// llama.cpp in DECISIONS.md D5. Slow by design — it streams and dequantizes every
+// weight for every token, and exists to be obviously correct, not fast.
+// ---------------------------------------------------------------------------
+struct LayerWeights {
+    // present in every block
+    const GgufTensor* attn_norm      = nullptr;
+    const GgufTensor* post_attn_norm = nullptr;
+    const GgufTensor* ffn_gate       = nullptr;
+    const GgufTensor* ffn_up         = nullptr;
+    const GgufTensor* ffn_down       = nullptr;
+    // full-attention blocks
+    const GgufTensor* attn_q         = nullptr;   // q and gate interleaved per head
+    const GgufTensor* attn_k         = nullptr;
+    const GgufTensor* attn_v         = nullptr;
+    const GgufTensor* attn_q_norm    = nullptr;
+    const GgufTensor* attn_k_norm    = nullptr;
+    const GgufTensor* attn_out       = nullptr;
+    // gated-deltanet blocks
+    const GgufTensor* attn_qkv       = nullptr;
+    const GgufTensor* attn_gate      = nullptr;   // z
+    const GgufTensor* ssm_alpha      = nullptr;
+    const GgufTensor* ssm_beta       = nullptr;
+    const GgufTensor* ssm_a          = nullptr;
+    const GgufTensor* ssm_dt_bias    = nullptr;
+    const GgufTensor* ssm_conv1d     = nullptr;
+    const GgufTensor* ssm_norm       = nullptr;
+    const GgufTensor* ssm_out        = nullptr;
+    bool is_attn = false;
+};
+
+struct RefModel {
+    GgufFile file;
+    Config   cfg;
+    const GgufTensor* token_embd  = nullptr;
+    const GgufTensor* output      = nullptr;
+    const GgufTensor* output_norm = nullptr;
+    std::vector<LayerWeights> layers;   // n_layer entries (index 64 = MTP block)
+
+    // Opens, validates the inventory, and resolves every tensor pointer.
+    bool load(const std::string& path, std::string* err);
+};
+
+struct RefState {
+    // gated-deltanet recurrent state, one entry per layer (empty for attn layers)
+    std::vector<std::vector<float>> conv_state;  // [(conv_k-1) * qkv_dim]
+    std::vector<std::vector<float>> ssm_state;   // [v_heads * S_k * S_v], S[j][r]
+    // KV cache, one entry per layer (empty for GDN layers); appended per token
+    std::vector<std::vector<float>> k_cache;     // [n_past][n_head_kv * head_dim]
+    std::vector<std::vector<float>> v_cache;
+    int32_t n_past = 0;
+
+    void reset(const Config& c);
+};
+
+// One decode step. Appends to the KV cache and advances the recurrent state.
+// `logits` is resized to n_vocab. Layers [0, n_layer_main) only — the MTP block
+// is Stage 3.
+void ref_forward(const RefModel& m, RefState& st, int32_t token, int32_t pos,
+                 std::vector<float>& logits);
+
+// Diagnostics for divergence hunting (PLAN §10): print per-layer activation
+// statistics at one position, and count how often the L2-norm epsilon floor
+// actually bound (a knife-edge where tiny input differences explode).
+void    ref_set_debug_pos(int32_t pos);
+int64_t ref_l2_eps_hits();
+
 }  // namespace ns
