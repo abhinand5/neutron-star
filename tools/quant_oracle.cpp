@@ -261,16 +261,59 @@ static int emit_golden(const std::string& model, const std::string& out) {
     return 0;
 }
 
+// Exhaustive check of one tensor: every block, not the start/middle/end sample.
+// A single bad block deep inside a weight matrix is invisible to sampling and
+// shows up as one wrong output row (that is exactly how DECISIONS.md D7 was found).
+static int check_tensor_full(const std::string& path, const std::string& tname) {
+    GgufFile f;
+    std::string err;
+    if (!f.open(path, &err)) { printf("cannot open %s: %s\n", path.c_str(), err.c_str()); return 1; }
+    const GgufTensor* t = f.tensor(tname);
+    if (!t) { printf("no tensor named %s\n", tname.c_str()); return 1; }
+    const TypeInfo& ti = type_info(t->type);
+    const int64_t nblocks = t->nelem / ti.blck;
+    printf("--- %s (%s) %" PRId64 " blocks, %" PRId64 " elements ---\n", tname.c_str(),
+           ti.name, nblocks, t->nelem);
+    std::vector<float> a((size_t)ti.blck), b((size_t)ti.blck);
+    int64_t bad_blocks = 0;
+    for (int64_t ib = 0; ib < nblocks; ib++) {
+        const uint8_t* src = t->data + (size_t)ib * ti.bytes;
+        dequant_row(t->type, src, a.data(), ti.blck);
+        ggml_dequant(t->type, src, b.data(), ti.blck);
+        for (int64_t i = 0; i < ti.blck; i++) {
+            if (!bit_equal(a[i], b[i])) {
+                if (bad_blocks < 5)
+                    printf("  MISMATCH block %" PRId64 " elem %" PRId64 " (row %" PRId64
+                           "): ns=%.9g ggml=%.9g\n",
+                           ib, i, (ib * ti.blck + i) / t->ne[0], a[i], b[i]);
+                bad_blocks++;
+                break;
+            }
+        }
+    }
+    printf("  %s: %" PRId64 " / %" PRId64 " blocks mismatched\n",
+           bad_blocks ? "MISMATCH" : "bit-exact", bad_blocks, nblocks);
+    return bad_blocks ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     const char* home = getenv("HOME");
     const std::string dir = std::string(home ? home : "") + "/dev/models/Qwen3.8-27B/";
     bool do_golden = false;
     int iters = 4096;
+    std::string full_tensor, full_model;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--golden") do_golden = true;
         else if (a == "--iters" && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (a == "--tensor" && i + 1 < argc) full_tensor = argv[++i];
+        else if (a == "--model" && i + 1 < argc) full_model = argv[++i];
         else { fprintf(stderr, "usage: quant_oracle [--golden] [--iters N]\n"); return 2; }
+    }
+
+    if (!full_tensor.empty()) {
+        const std::string mp = full_model.empty() ? dir + "Qwen3.8-27B-UD-Q4_K_XL.gguf" : full_model;
+        return check_tensor_full(mp, full_tensor);
     }
 
     int failures = 0;

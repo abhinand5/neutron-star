@@ -193,5 +193,8 @@ void ref_forward(const RefModel& m, RefState& st, int32_t token, int32_t pos,
 // actually bound (a knife-edge where tiny input differences explode).
 void    ref_set_debug_pos(int32_t pos);
 int64_t ref_l2_eps_hits();
+void    ref_set_act_quant(bool on);               // emulate ggml's Q8_K activations
+void    ref_open_activations(const char* path);   // capture values, not just stats
+void    ref_close_activations();
 
 }  // namespace ns

@@ -91,7 +91,8 @@ endif
 
 tools: $(TOOLBINS)
 
-$(BUILDDIR)/tools/oracle_logits: tools/oracle_logits.cpp
+ORACLE_BINS := $(BUILDDIR)/tools/oracle_logits $(BUILDDIR)/tools/oracle_activations
+$(ORACLE_BINS): $(BUILDDIR)/tools/%: tools/%.cpp
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include $< \
 	  -L$(GGML_LIBDIR) -lllama -lggml -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@

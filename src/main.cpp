@@ -40,7 +40,8 @@ static int usage() {
 }
 
 static int cmd_eval(const std::string& path, const std::string& tokens_csv, int topk,
-                    bool all_pos, const std::string& dump_path, int debug_pos = -1) {
+                    bool all_pos, const std::string& dump_path, int debug_pos = -1,
+                    const std::string& act_path = "") {
     std::vector<int32_t> tokens;
     {
         size_t p = 0;
@@ -62,6 +63,10 @@ static int cmd_eval(const std::string& path, const std::string& tokens_csv, int 
            now_sec() - t_load0, m.layers.size(), m.cfg.n_vocab);
 
     if (debug_pos >= 0) ref_set_debug_pos(debug_pos);
+    if (!act_path.empty()) {
+        NS_CHECK(debug_pos >= 0, "--dump-activations needs --debug-pos");
+        ref_open_activations(act_path.c_str());
+    }
     RefState st;
     st.reset(m.cfg);
     std::vector<float> logits;
@@ -93,6 +98,8 @@ static int cmd_eval(const std::string& path, const std::string& tokens_csv, int 
                    exp((double)(logits[idx[j]] - mx)) / sum);
         printf("\n");
     }
+    ref_close_activations();
+    if (!act_path.empty()) printf("activations written to %s\n", act_path.c_str());
     if (dump) { fclose(dump); printf("logits written to %s\n", dump_path.c_str()); }
     printf("L2-norm eps floor bound %" PRId64 " times\n", ref_l2_eps_hits());
     return 0;
@@ -201,9 +208,9 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     if (cmd == "eval") {
         if (argc < 3) return usage();
-        std::string tokens, dump;
+        std::string tokens, dump, act;
         int topk = 5, debug_pos = -1;
-        bool all_pos = false;
+        bool all_pos = false, act_quant = false;
         for (int i = 3; i < argc; i++) {
             const std::string a = argv[i];
             if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
@@ -211,9 +218,12 @@ int main(int argc, char** argv) {
             else if (a == "--dump-logits" && i + 1 < argc) dump = argv[++i];
             else if (a == "--all-pos") all_pos = true;
             else if (a == "--debug-pos" && i + 1 < argc) debug_pos = atoi(argv[++i]);
+            else if (a == "--dump-activations" && i + 1 < argc) act = argv[++i];
+            else if (a == "--ggml-act-quant") act_quant = true;
             else return usage();
         }
-        return cmd_eval(argv[2], tokens, topk, all_pos, dump, debug_pos);
+        if (act_quant) ref_set_act_quant(true);
+        return cmd_eval(argv[2], tokens, topk, all_pos, dump, debug_pos, act);
     }
     if (cmd == "inspect") {
         if (argc < 3) return usage();

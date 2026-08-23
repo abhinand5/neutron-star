@@ -33,8 +33,44 @@ static int32_t g_debug_pos = -1;
 static int32_t g_cur_pos   = -1;
 void ref_set_debug_pos(int32_t pos) { g_debug_pos = pos; }
 
+// Activation capture for layer bisection. Same record format as
+// tools/oracle_activations.cpp so tools/compare_activations.py reads both:
+//   "NSAC" | u32 n_records | per record: u32 name_len, name, u64 n_elem, f32[n]
+static FILE*   g_act_file  = nullptr;
+static uint32_t g_act_count = 0;
+void ref_open_activations(const char* path) {
+    g_act_file = fopen(path, "wb");
+    NS_CHECK(g_act_file, "cannot write activations to %s", path);
+    fwrite("NSAC", 1, 4, g_act_file);
+    const uint32_t placeholder = 0;
+    fwrite(&placeholder, sizeof placeholder, 1, g_act_file);
+    g_act_count = 0;
+}
+void ref_close_activations() {
+    if (!g_act_file) return;
+    fseek(g_act_file, 4, SEEK_SET);          // patch the record count
+    fwrite(&g_act_count, sizeof g_act_count, 1, g_act_file);
+    fclose(g_act_file);
+    g_act_file = nullptr;
+}
+// llama.cpp names graph tensors "<what>-<layer>" (llm_graph_context::cb), so we
+// emit the identical spelling and the comparison can match on name alone.
+static void dbg_dump(const char* what, uint32_t il, const float* v, int64_t n) {
+    if (!g_act_file || g_cur_pos != g_debug_pos) return;
+    char name[64];
+    snprintf(name, sizeof name, "%s-%u", what, il);
+    const uint32_t nl = (uint32_t)strlen(name);
+    const uint64_t ne = (uint64_t)n;
+    fwrite(&nl, sizeof nl, 1, g_act_file);
+    fwrite(name, 1, nl, g_act_file);
+    fwrite(&ne, sizeof ne, 1, g_act_file);
+    fwrite(v, sizeof(float), (size_t)n, g_act_file);
+    g_act_count++;
+}
+
 static void dbg_stat(const char* what, uint32_t il, const float* v, int64_t n) {
     if (g_cur_pos != g_debug_pos) return;
+    dbg_dump(what, il, v, n);
     double sumsq = 0.0;
     float mn = v[0], mx = v[0];
     int64_t n_nonfinite = 0;
@@ -57,6 +93,56 @@ static inline float silu(float x)    { return x / (1.0f + expf(-x)); }
 static inline float sigmoidf(float x){ return 1.0f / (1.0f + expf(-x)); }
 // ggml op_softplus (unary-ops.cpp:80) — the x>20 guard is load-bearing
 static inline float softplus(float x){ return x > 20.0f ? x : logf(1.0f + expf(x)); }
+
+// ---------------------------------------------------------------------------
+// Optional: emulate llama.cpp's activation quantization.
+//
+// For Q4_K/Q5_K/Q6_K/IQ4_XS, ggml sets vec_dot_type = GGML_TYPE_Q8_K, i.e. it
+// quantizes the *activation* vector to int8 (per-256 block scale) and does an
+// integer dot product. cpu_ref instead dequantizes the weights exactly and dots
+// in fp32, which is more accurate but numerically different — and that
+// difference, compounded over 64 layers, is what separates ns from the oracle
+// (DECISIONS.md D7). Turning this on rounds the activation the same way ggml
+// does, so parity measures ns's *logic* rather than ns's superior arithmetic.
+//
+// Port of quantize_row_q8_K_ref (ggml-quants.c): iscale = -127/max, where max is
+// the signed value of largest magnitude, then q = min(127, nearest_int(iscale*x)).
+static bool g_act_quant = false;
+void ref_set_act_quant(bool on) { g_act_quant = on; }
+
+static inline int nearest_int_ns(float fval) {
+    // ggml's nearest_int: assumes |fval| <= 4194303
+    float val = fval + 12582912.f;
+    int i;
+    memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+static void quantize_act_q8_K(const float* x, float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    for (int64_t i = 0; i < nb; i++) {
+        const float* xb = x + i * 256;
+        float* yb = y + i * 256;
+        float amax = 0.f, mx = 0.f;
+        for (int j = 0; j < 256; ++j) {
+            const float ax = fabsf(xb[j]);
+            if (ax > amax) { amax = ax; mx = xb[j]; }
+        }
+        if (amax == 0.f) {
+            for (int j = 0; j < 256; ++j) yb[j] = 0.f;
+            continue;
+        }
+        const float iscale = -127.f / mx;
+        const float d = 1.f / iscale;
+        for (int j = 0; j < 256; ++j) {
+            int v = nearest_int_ns(iscale * xb[j]);
+            if (v > 127) v = 127;
+            yb[j] = (float)v * d;      // quantize then dequantize
+        }
+    }
+    // tail elements (k not a multiple of 256) pass through unchanged
+    for (int64_t i = nb * 256; i < k; i++) y[i] = x[i];
+}
 
 static inline size_t row_bytes(const GgufTensor& t) {
     const TypeInfo& ti = type_info(t.type);
@@ -91,6 +177,14 @@ static void matvec(const GgufTensor& w, const float* x, float* y) {
     const size_t rb = row_bytes(w);
     const int32_t type = w.type;
     const uint8_t* base = w.data;
+
+    // round the activation the way ggml would, when asked to
+    std::vector<float> xq;
+    if (g_act_quant && type_info(type).blck == 256) {
+        xq.resize((size_t)k);
+        quantize_act_q8_K(x, xq.data(), k);
+        x = xq.data();
+    }
 #pragma omp parallel
     {
         std::vector<float> row((size_t)k);
@@ -244,10 +338,19 @@ static void gdn_layer(const RefModel& m, RefState& st, uint32_t il, const float*
         l2_norm(k + h * S, S, c.rms_eps);
     }
 
+    dbg_stat("linear_attn_qkv_mixed", il, mixed.data(), QKV);
+    dbg_stat("conv_output_silu", il, conv.data(), QKV);
+    dbg_stat("q_conv_predelta", il, q, HK * S);
+    dbg_stat("k_conv_predelta", il, k, HK * S);
+    dbg_stat("v_conv_predelta", il, v, HV * S);
+    dbg_stat("beta_sigmoid", il, beta.data(), HV);
+    dbg_stat("z", il, z.data(), DI);
+    dbg_stat("state_predelta", il, st.ssm_state[il].data(), (int64_t)st.ssm_state[il].size());
+
     // 7. delta rule per v-head, 8. gated norm
     const float  qscale   = 1.0f / sqrtf((float)S);
     const float* ssm_norm = f32_data(L.ssm_norm);
-    std::vector<float> gated((size_t)DI);
+    std::vector<float> gated((size_t)DI), raw_o((size_t)DI);
     std::vector<float> o((size_t)S), sk((size_t)S), e((size_t)S);
 #pragma omp parallel for schedule(static) firstprivate(o, sk, e)
     for (int64_t h = 0; h < HV; h++) {
@@ -275,11 +378,18 @@ static void gdn_layer(const RefModel& m, RefState& st, uint32_t il, const float*
             for (int64_t j = 0; j < S; j++) s += S_[j * S + r] * qh[j] * qscale;
             o[(size_t)r] = s;
         }
+        memcpy(&raw_o[(size_t)h * S], o.data(), (size_t)S * sizeof(float));
+
         // 8. RMSNorm(o, ssm_norm) * SiLU(z_h)
         float* dst = &gated[(size_t)h * S];
         rms_norm(o.data(), ssm_norm, dst, S, c.rms_eps);
         for (int64_t r = 0; r < S; r++) dst[r] *= silu(z[(size_t)(h * S + r)]);
     }
+
+    dbg_stat("attn_output", il, raw_o.data(), DI);
+    dbg_stat("dnet_add_ar_state", il, st.ssm_state[il].data(),
+             (int64_t)st.ssm_state[il].size());
+    dbg_stat("final_output", il, gated.data(), DI);
 
     // 9. out projection
     matvec(*L.ssm_out, gated.data(), out);
@@ -397,7 +507,7 @@ void ref_forward(const RefModel& m, RefState& st, int32_t token, int32_t pos,
         rms_norm(h.data(), f32_data(m.layers[il].attn_norm), xb.data(), E, c.rms_eps);
         if (m.layers[il].is_attn) attn_layer(m, st, il, xb.data(), pos, tmp.data());
         else                      gdn_layer(m, st, il, xb.data(), tmp.data());
-        dbg_stat(m.layers[il].is_attn ? "attn_out" : "linear_attn_out", il, tmp.data(), E);
+        dbg_stat(m.layers[il].is_attn ? "attn_output" : "linear_attn_out", il, tmp.data(), E);
         for (int64_t i = 0; i < E; i++) h[(size_t)i] += tmp[(size_t)i];
 
         // FFN sublayer (PLAN §4.3 C)

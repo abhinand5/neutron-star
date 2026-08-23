@@ -290,9 +290,51 @@ ns fails on its own merits, not because of a threshold. See the open bug below.
 
 ---
 
-## D7 — OPEN BUG: cpu_ref diverges transiently at isolated positions
+## D7 — RESOLVED: the divergence was llama.cpp's quantized activations, not an ns bug
 
-**Date:** 2026-08-22 (Stage 1) · **Status: open, precise repro in hand**
+**Date:** 2026-08-22 (Stage 1) · **Status: root-caused and fixed**
+
+**Resolution (read this first; the investigation below is kept for the record).**
+llama.cpp does not compute quantized matmuls in fp32. For Q4_K/Q5_K/Q6_K/IQ4_XS,
+ggml sets `vec_dot_type = GGML_TYPE_Q8_K`: it **quantizes the activation vector to
+int8** (one fp32 scale per 256 elements) and does an integer dot product. cpu_ref
+dequantized the weights exactly and dotted in fp32 — *more* accurate, but
+numerically different by ~0.1–0.4% per matmul. Compounded over 64 layers the two
+engines drift apart, and at layer 62 a heavily-cancelling dot product
+(`attn_qkv` row 4951: ns +8.394 vs llama.cpp −6.048, neighbouring rows agreeing to
+0.05) flipped sign, which fed one GDN v-head, was amplified by the per-head RMSNorm,
+and blew up the logits.
+
+`ns eval --ggml-act-quant` rounds activations exactly as
+`quantize_row_q8_K_ref` does. On the worst prompt (p4):
+
+| metric | exact fp32 activations | ggml-style activations | control (llama.cpp vs itself) |
+|---|---|---|---|
+| top-1 agreement | 0.9333 | **0.9667** | 0.9667 |
+| cosine mean | 0.99718 | **0.99964** | 0.99967 |
+| cosine worst | 0.95580 | **0.99891** | 0.99905 |
+
+ns's agreement with llama.cpp is now indistinguishable from llama.cpp's agreement
+with itself. **The engine was never wrong; the oracle is lossy and cpu_ref was not.**
+
+This matters beyond the gate: PLAN §7.5 already specifies MMVQ-style integer dot
+with quantized activations for the GPU decode kernels, so the *shipping* engine will
+naturally sit on llama.cpp's side of this difference. Parity runs should use
+`--ggml-act-quant`; the exact-fp32 mode stays available and is the better reference
+for judging quantization quality itself.
+
+**Correction to an earlier inference in this entry:** the double-accumulation
+experiment (below) was read as proving the divergence "structural, not numerical".
+That was wrong. It showed only that ns is *internally* stable to its own rounding;
+it said nothing about the gap to llama.cpp, which came from the oracle's activation
+quantization. Perturbing one engine cannot rule out a numerical difference located
+in the other.
+
+---
+
+### Original investigation (kept: the elimination path is reusable)
+
+**Status when opened: open, precise repro in hand**
 
 **Repro.** Prompt p4 ("Memory bandwidth is the fundamental limit on single-stream
 transformer decoding, because every weight must be read from DRAM once per generated

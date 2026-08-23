@@ -1,0 +1,1 @@
+Memory bandwidth is the fundamental limit on single-stream transformer decoding, because every weight must be read from DRAM once per generated token regardless of batch size.
