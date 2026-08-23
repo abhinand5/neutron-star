@@ -1126,3 +1126,82 @@ No whitespace errors. `test_gguf`, `test_gpu_gdn`, `test_gpu_gemv`,
 **NEXT:** Stage 2 task 4 in PLAN order: implement A2 attention decode plus fp16 KV
 cache append, and validate q/k norm, partial MRoPE, GQA mapping, causal softmax, and
 sigmoid gating against a naive CPU reference before performance work.
+
+---
+
+## 2026-08-23 — Session 10 (Stage 2 task 4: A2 attention correctness, GPT-5.6 Sol)
+
+**Stage 2 task 4's correctness acceptance is complete.** Added the single-token A2
+interface/kernel and a literal fp16-KV CPU oracle. The recurrent unit test is green
+at `8.80e-6` worst output max-absolute error, below the Stage 2 fp32 correctness
+bound of `1e-4` without changing tolerance after measurement.
+
+### 1. A2 semantics and race-free cache ownership
+
+Added `src/attention.h` and `src/kernels/attention.hip`. One 256-thread workgroup
+owns each of the 24 query heads. In one launch it performs:
+
+- per-head RMSNorm for q and k with the shared 256-element norm weights;
+- text-only partial NeoX RoPE on the first 64 dimensions (`p` paired with `p+32`);
+- causal online-softmax decode at scale `1/sqrt(256) = 0.0625`;
+- D5's contiguous GQA mapping (`q_head / 6`, never modulo); and
+- elementwise sigmoid gating of the 6,144-element attention result.
+
+The KV cache is token-major fp16 `[capacity][4][256]`. Query heads 0, 6, 12, and
+18 exclusively append KV heads 0, 1, 2, and 3. All six query heads sharing a KV
+head independently compute the same current k/v and consume its fp16 round-trip
+from workgroup-local storage. This removes any need for an impossible grid-wide
+barrier while ensuring current-token attention sees exactly fp16 cache semantics.
+Past tokens come from the cache. The public launch interface allocates nothing and
+does not synchronize its stream.
+
+### 2. Recurrent fp16-KV CPU-oracle gate
+
+Command:
+
+```bash
+./build/release/tests/test_gpu_attention
+```
+
+The deterministic test starts from 13 prefilled fp16 tokens, appends four more
+tokens at nontrivial RoPE positions 97, 210, 323, and 436, and checks all 24 query
+heads after every step. Cache heads have deliberately different distributions so
+the incorrect modulo GQA mapping fails loudly. It also covers zero q/k input for
+the RMS epsilon path, gates at -30/+30, invalid launch arguments, cache bounds, and
+untouched cache capacity.
+
+Result:
+
+```text
+GREEN — 4 fp16-KV recurrent steps; output max 8.8e-06;
+        K-cache max 0.000977 (<=1 fp16 step), V bits exact; 24,609 checks
+```
+
+The CPU oracle accumulates RMS squares in double, like `cpu_ref`, while the GPU
+reduces in fp32. One normalized K value landed on the adjacent fp16 value
+(`-1.12109375` vs `-1.12011719`, difference `0.0009765625`); every other tested
+cache value was bit-identical. This is retained as an explicit one-fp16-step bound,
+not hidden by changing the oracle's reduction order. The attention result remains
+more than 11x inside the required fp32 error bound.
+
+### 3. Full regression suite
+
+```bash
+git diff --check
+make -j$(nproc) test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_gdn`,
+`test_gpu_gemv`, `test_gpu_upload`, `test_quants`, `test_repack`,
+`test_compare_gate.py`, and `test_compare_tokens.py` all PASS. All new HIP code was
+compiled with `--offload-arch=gfx1201` exactly.
+
+No A2 performance claim is made in this task: PLAN Stage 2 task 4 accepts the CPU
+reference unit test, and §7.6's split-sequence two-pass kernel belongs to the
+profile/performance pass after eager forward wiring exposes real context buckets.
+The correctness kernel deliberately favors obvious semantics over long-context
+bandwidth (six query heads reread a shared KV head).
+
+**NEXT:** Stage 2 task 5: add `forward.cpp`, activation/state/KV arenas, and wire an
+eager full decode step from the validated GEMV, K2, and A2 primitives. Then run the
+GPU path through G1's parity harness before graph capture or performance tuning.
