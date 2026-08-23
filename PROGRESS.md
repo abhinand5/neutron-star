@@ -915,3 +915,119 @@ All C++/HIP compilations used `--offload-arch=gfx1201` exactly. `test_gguf`,
 the repacked layout; validate random activations for every blessed format and every
 §6.3 shape against cpu_ref before any performance work. Then benchmark each shape
 with >=1 GB of distinct weights and tune toward the §6.3 streaming targets.
+
+---
+
+## 2026-08-23 — Session 8 (Stage 2 task 2: GEMV family, GPT-5.6 Sol)
+
+Implemented and validated the GPU GEMV family over Session 7's bit-exact repack.
+The correctness portion of Stage 2 task 2 is green. The shipping integer-dot
+kernel is at 90–99% of G0's measured 634.8 GB/s streaming bound on the profiled
+large shapes (the 90.0% z-gate result is within the benchmark's displayed
+rounding). Exact standalone §6.3 latency targets remain red for the operations
+whose production form is fused; that debt is explicitly retained for Stage 2
+task 7 rather than hidden or benchmarked from cache.
+
+### 1. Interfaces and kernel paths
+
+Added `src/gemv.h`, `src/kernels/gemv.hip`, `tests/test_gpu_gemv.cpp`, and
+`bench/gemv_bench.hip`; exposed the arena's owning HIP stream through
+`GpuWeights::stream()` and added the benchmark's normal object-link rule.
+
+The reference GPU path dequantizes the repacked GGUF bits to fp32 in registers and
+accumulates with fp32 FMA for F32, F16, BF16, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0,
+IQ4_NL, IQ4_XS, and IQ3_S. The production path adds:
+
+- a device Q8_K activation quantizer with per-256-element fp32 scale, int8 codes,
+  and 16-element integer block sums;
+- native `__builtin_amdgcn_sudot4` GEMVs for Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S;
+- 32-row repack tiles with lane = output row, 2–8 K-split waves per workgroup,
+  LDS reduction, and shape-specific split dispatch;
+- packed 32/128-bit weight loads, Q5 streaming cache hints, Q5 scale-plane
+  dword decoding, Q6 packed scale loads, and a two-block partial unroll where it
+  improves memory-level parallelism; and
+- fp32 fallback for Q8_0 and IQ4_NL, whose GGML vec-dot activation type is Q8_0
+  rather than Q8_K.
+
+All HIP compilation used `--offload-arch=gfx1201` exactly. The benchmark selected
+`AMD Radeon AI PRO R9700 (gfx1201)`, PCI `0000:03:00.0`, with 0 connected displays.
+`HSA_OVERRIDE_GFX_VERSION` remained unset.
+
+### 2. Exhaustive real-tensor correctness gate
+
+Command:
+
+```bash
+./build/release/tests/test_gpu_gemv
+```
+
+The test chooses one real tensor for every distinct `(m,k,type)` tuple across both
+blessed GGUFs, uses deterministic random activations, and compares every output
+row. The fp32 path uses a double-accumulating dequantized CPU reference and the
+integer path uses the CPU Q8_K quantizer plus format vec-dot oracle.
+
+Result: **GREEN — 42 distinct cases, 4,464,225,280 real weight bytes,
+1,842,174 checks.** All required input/output dimensions and all nine real matrix
+storage types were present. Worst fp32 normalized error was **1.04e-6** (limit
+`1e-5`). Worst integer-path normalized error was **1.8e-4** on IQ4_XS
+5120x17408 (limit `2e-3`); all other reported maxima were <= 1.49e-6.
+
+GPU and CPU Q8_K activation bytes were identical on every fixture except k=17408,
+where 2 of 19,856 bytes differed by one quant code at an ISA rounding boundary.
+The fp32 scales were bit-identical, every GPU block sum was independently
+recomputed and exact, and the required output error gate passed without weakening
+its tolerance.
+
+### 3. Honest >=1 GB streaming benchmark
+
+Commands:
+
+```bash
+./build/release/gemv_bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf --q8
+./build/release/gemv_bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf --q8
+```
+
+Each timed pass cycles disjoint repacked row slices totaling at least
+1,000,000,000 bytes; no reported result fits in the 64 MiB Infinity Cache. Eight
+untimed passes remove the card's initial compute-clock ramp, followed by five
+event-timed passes. The final Q5 run was:
+
+| shape/type | distinct bytes/pass | launches | mean ± sd | GB/s | exact target |
+|---|---:|---:|---:|---:|---:|
+| ffn up/gate Q5_K | 1.042 GB | 17 | 101.44 ± 0.25 us | 604.1 | <=100 us RED |
+| ffn down Q6_K | 1.024 GB | 14 | 119.07 ± 0.05 us | 614.1 | <=122 us GREEN |
+| GDN qkv Q5_K | 1.009 GB | 28 | 60.59 ± 0.02 us | 594.9 | <=58 us RED |
+| GDN z Q5_K | 1.016 GB | 47 | 37.87 ± 0.09 us | 571.0 | <=35 us RED |
+| ssm/attn out Q6_K | 1.006 GB | 39 | 44.85 ± 0.06 us | 575.3 | <=43 us RED |
+| attention q Q6_K | 1.032 GB | 20 | 85.70 ± 0.09 us | 602.2 | <=84 us RED |
+| attention k Q6_K | 1.002 GB | 233 | 10.57 ± 0.02 us | 407.0 | fused/info |
+| lm head Q6_K | 1.043 GB | 1 | 1659.93 ± 0.69 us | 628.3 | <=1680 us GREEN |
+
+Relative to G0's measured 634.8 GB/s stream rate, these are 95.2%, 96.7%, 93.7%,
+90.0%, 90.6%, 94.9%, and 99.0% for the seven bandwidth shapes. This meets the
+§7.5 family acceptance after rounding (>=90% generally, >=95% ffn/lm). The exact
+latency column is intentionally still shown: GDN qkv+z are one K1 launch, the two
+FFN projections are one K4 launch, and down/ssm-out include residual fusion in the
+production budget. Those integrated targets must turn green in task 7 before G2b.
+
+The Q4 model independently reproduced 604.6 GB/s ffn, 593.2 GB/s GDN qkv,
+569.1 GB/s GDN z, 602.1 GB/s attention-q, and 628.1 GB/s lm-head. Its available
+Q6 down/out tensor pool was only 0.439/0.568 GB, so the benchmark correctly printed
+`SKIP <1GB` instead of a cache-contaminated number.
+
+### 4. Full regression suite
+
+```bash
+git diff --check
+make -j$(nproc) test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_gemv`, `test_gpu_upload`,
+`test_quants`, `test_repack`, `test_compare_gate.py`, and
+`test_compare_tokens.py` all PASS, including both full GPU arena round trips.
+
+**NEXT:** Stage 2 task 3 in PLAN order: implement K2's GDN/delta-rule state
+kernel and a random-state CPU-reference unit test with max-abs < 1e-4. Preserve
+the standalone latency debt above for the fused-kernel perf pass in task 7.

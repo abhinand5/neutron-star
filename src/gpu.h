@@ -10,6 +10,8 @@
 #include "ns.h"
 #include "repack.h"
 
+#include <hip/hip_runtime_api.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -64,6 +66,7 @@ public:
     const GpuLoadStats& stats() const;
     const std::vector<GpuTensor>& tensors() const;
     const GpuTensor* tensor(const std::string& name) const;
+    hipStream_t stream() const;
     bool loaded() const;
 
 private:

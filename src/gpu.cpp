@@ -354,6 +354,7 @@ bool GpuWeights::load(const std::string& path, bool allow_display, bool verify_u
 const Config& GpuWeights::config() const { return impl_->config; }
 const GpuLoadStats& GpuWeights::stats() const { return impl_->stats; }
 const std::vector<GpuTensor>& GpuWeights::tensors() const { return impl_->tensors; }
+hipStream_t GpuWeights::stream() const { return impl_->stream; }
 bool GpuWeights::loaded() const { return impl_->arena != nullptr; }
 
 const GpuTensor* GpuWeights::tensor(const std::string& name) const {
