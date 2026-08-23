@@ -5,6 +5,7 @@
 // Chat/complete/--profile arrive with the decode engine (Stage 2).
 // ============================================================================
 #include "ns.h"
+#include "gpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +32,10 @@ static int usage() {
             "usage: ns inspect <model.gguf> [--kv] [--tensors]\n"
             "  --kv        dump every metadata key\n"
             "  --tensors   dump every tensor (name, shape, type, offset)\n"
+            "\n"
+            "       ns upload <model.gguf> [--verify] [--allow-display]\n"
+            "  repacks every weight into one gfx1201 VRAM arena. --verify copies\n"
+            "  every byte back and proves repack -> upload -> unpack identity.\n"
             "\n"
             "       ns eval <model.gguf> --tokens a,b,c [--topk N] [--all-pos]\n"
             "                            [--dump-logits FILE] [--generate N]\n"
@@ -228,6 +233,36 @@ static int cmd_inspect(const std::string& path, bool dump_kv, bool dump_tensors)
     return 0;
 }
 
+static int cmd_upload(const std::string& path, bool verify, bool allow_display) {
+    GpuWeights weights;
+    std::string error;
+    if (!weights.load(path, allow_display, verify, &error)) {
+        fprintf(stderr, "ns: GPU upload failed: %s\n", error.c_str());
+        return 1;
+    }
+    const GpuLoadStats& stats = weights.stats();
+    printf("gpu              %s (%s), PCI %s, device index %d\n",
+           stats.device_name.c_str(), stats.device_arch.c_str(),
+           stats.device_pci.c_str(), stats.device_index);
+    if (stats.connected_displays < 0)
+        printf("display guard    sysfs unavailable; connector state unknown\n");
+    else
+        printf("display guard    %d connected display(s)%s\n", stats.connected_displays,
+               allow_display ? " (--allow-display)" : "");
+    printf("weights          %zu tensors, %.3f GiB exact GGUF bytes\n",
+           stats.tensor_count, stats.tensor_bytes / GiB);
+    printf("arena            %.3f GiB, %zu alignment bytes; staging %.1f MiB\n",
+           stats.arena_bytes / GiB, stats.alignment_padding,
+           stats.staging_bytes / (1024.0 * 1024.0));
+    printf("timing           plan %.3f s; repack + upload %.3f s",
+           stats.plan_seconds, stats.upload_seconds);
+    if (verify) printf("; readback + unpack %.3f s", stats.verify_seconds);
+    printf("\n");
+    if (verify)
+        printf("verification     GREEN — every uploaded tensor is bit-exact after unpack\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string cmd = argv[1];
@@ -264,6 +299,18 @@ int main(int argc, char** argv) {
             else return usage();
         }
         return cmd_inspect(argv[2], kv, tens);
+    }
+    if (cmd == "upload") {
+        if (argc < 3) return usage();
+        bool verify = false;
+        bool allow_display = false;
+        for (int i = 3; i < argc; i++) {
+            const std::string argument = argv[i];
+            if (argument == "--verify") verify = true;
+            else if (argument == "--allow-display") allow_display = true;
+            else return usage();
+        }
+        return cmd_upload(argv[2], verify, allow_display);
     }
     return usage();
 }

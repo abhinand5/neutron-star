@@ -4,9 +4,10 @@ An educational guide to what this project is building, how a large-language-mode
 inference engine works, why neutron-star is designed this way, and how to follow the
 implementation as it grows.
 
-**Status snapshot:** 2026-08-23. Gate G0 and Gate G1 are green. Stage 2 has begun;
-the exact CPU-side Q8_K integer row dot is complete, and the next implementation
-work is the GPU VRAM arena plus bit-preserving weight repacking and upload.
+**Status snapshot:** 2026-08-23. Gate G0 and Gate G1 are green. Stage 2 tasks 0–1
+are complete: exact CPU-side Q8_K integer row dots, the static GPU weight arena,
+bit-preserving repack, pinned staging, upload, and full-model readback verification.
+The current implementation task is the fp32-dequant GPU GEMV family.
 
 ---
 
@@ -666,8 +667,8 @@ and is the numerical model for the shipping GPU GEMV.
 
 GGUF stores each quant block as a convenient self-contained structure—an array of
 structures. A GPU wave often wants all quant words for adjacent rows together, then
-all scales, so every lane can issue aligned 16-byte loads. The loader will therefore
-**repack** bytes into a kernel-oriented arrangement.
+all scales, so every lane can issue aligned 16-byte loads. The loader therefore
+**repacks** bytes into a kernel-oriented arrangement.
 
 Conceptually:
 
@@ -683,7 +684,11 @@ No numerical value changes. The proof obligation is strong and simple:
 original bytes → repack → unpack → original bytes, bit for bit
 ```
 
-That invertibility test is the next Stage 2 task's central correctness guard.
+The implemented layout tiles 32 output rows, splits each exact block format into
+quant/scale/delta planes, and transposes each plane in 16-byte chunks. It introduces
+no padding: repacked tensor bytes equal GGUF tensor bytes. The invertibility test
+has compared every byte of all 866 tensors in both blessed files; GPU readback and
+unpack produced the same result.
 
 ---
 
@@ -691,8 +696,9 @@ That invertibility test is the next Stage 2 task's central correctness guard.
 
 ### 12.1 The static VRAM arena
 
-The engine will calculate all persistent sizes at model load and make one large GPU
-allocation. Tensors and state buffers receive aligned offsets inside this **arena**.
+The engine calculates persistent weight sizes at model load and makes one large GPU
+allocation. Tensors receive 256-byte-aligned offsets inside this **arena**; state and
+scratch regions join the same startup plan as their kernels land.
 
 Why one arena?
 
@@ -702,7 +708,7 @@ Why one arena?
 - fewer allocation fragments;
 - all model uploads can be planned up front.
 
-The intended load flow is:
+The implemented weight-load flow is:
 
 ```text
 mmap GGUF
@@ -1083,18 +1089,19 @@ model implementation against which every GPU operation can be tested.
 
 An extra task 0 first implemented exact Q8_K × K-quant row arithmetic because this
 is both the explanation for Stage 1 numerical behavior and the future GEMV oracle.
-It is complete.
+It is complete. Task 1 is also complete: the two full model images upload through
+64 MiB of pinned staging into one arena each, and device readback proves exact
+repack inversion.
 
 The remaining work, in order:
 
-1. **Current:** static VRAM arena, bit-preserving repack, and asynchronous upload.
-2. GPU GEMV family, beginning with the simplest correct path and validating every
+1. **Current:** GPU GEMV family, beginning with the simplest correct path and validating every
    type/shape before tuning.
-3. Fused GDN K2 kernel.
-4. Attention/KV kernel.
-5. Full eager GPU forward pass and G1-equivalent parity.
-6. HIP graph capture and per-kernel profiler.
-7. Performance tuning against the measured shape budgets.
+2. Fused GDN K2 kernel.
+3. Attention/KV kernel.
+4. Full eager GPU forward pass and G1-equivalent parity.
+5. HIP graph capture and per-kernel profiler.
+6. Performance tuning against the measured shape budgets.
 
 Gate G2 separates correctness from speed:
 
@@ -1139,9 +1146,11 @@ v1 gates.
 
 | Path | Role |
 |---|---|
-| `src/main.cpp` | Current `ns inspect` and `ns eval` command-line interface. |
+| `src/main.cpp` | Current `ns inspect`, `ns eval`, and verified GPU-upload command-line interface. |
 | `src/gguf.cpp`, `src/gguf.h` | Bounds-checked GGUF v3 reader and mapped tensor directory. |
-| `src/loader.cpp` | Model metadata and tensor-inventory validation; will gain GPU upload. |
+| `src/loader.cpp` | Model metadata and tensor-inventory validation. |
+| `src/repack.cpp`, `src/repack.h` | Invertible, 32-row-tiled per-format GPU byte layout. |
+| `src/gpu.cpp`, `src/gpu.h` | gfx1201 selection, display guard, static VRAM arena, pinned staging, upload, and readback verification. |
 | `src/ns.h` | Shared configuration, tensor, state, and model declarations. |
 | `src/quants.cpp`, `src/quants.h` | Quant block structures and exact CPU dequantization. |
 | `src/vec_dot.cpp` | Scalar Q8_K activation quantization and K-quant integer row dots. |

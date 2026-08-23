@@ -805,3 +805,113 @@ so compute tests were not rerun.
 
 **NEXT:** implementation remains Stage 2 task 1: VRAM arena, bit-preserving
 per-format repack/upload, and repack -> unpack bit-exact tests.
+
+---
+
+## 2026-08-23 — Session 7 (Stage 2 task 1: VRAM arena + repack/upload, GPT-5.6 Sol)
+
+**Stage 2 task 1 is complete.** Both blessed model files now pass an all-byte CPU
+repack round trip and an independent full-arena gfx1201 upload/readback round trip.
+
+### 1. Session safety and module contract
+
+Read AGENTS.md, PLAN Part 0, Part 2, §5.4–5.5, Part 7, Part 8, the latest
+PROGRESS entries, and DECISIONS through D9. Hardware discovery and the forbidden
+override check were:
+
+```bash
+rocminfo | rg 'Name:.*gfx|Marketing Name:'
+bash -c 'if [[ -v HSA_OVERRIDE_GFX_VERSION ]]; then echo set; else echo unset; fi'
+```
+
+The R9700 reports native `gfx1201`, the host also reports the `gfx1036` iGPU, and
+`HSA_OVERRIDE_GFX_VERSION=unset`.
+
+The new repack module has one layout contract for all known blessed-model types.
+Quantized matrices are tiled in 32 output rows. Within each K block, the exact GGUF
+fields are split into per-format quant/scale/delta planes; each plane is transposed
+in 16-byte chunks across the row tile. This makes the main quant plane suitable for
+aligned per-lane 16-byte loads while preserving every byte and adding no padding.
+F32/F16/BF16 use the identity layout. The eight quant layouts are Q3_K, Q4_K,
+Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, and IQ3_S.
+
+`GpuWeights::load` is the small owning interface over the rest of the task. It:
+
+- opens and validates the GGUF inventory;
+- scans HIP devices for `gcnArchName == gfx1201` rather than assuming an index;
+- applies D4's DRM display-attachment guard (with only the explicit
+  `--allow-display` override);
+- plans 256-byte-aligned tensor slots, allocates one VRAM arena, and allocates one
+  64 MiB pinned staging buffer;
+- repacks and calls `hipMemcpyAsync` for every tensor; and
+- optionally reads every arena byte back, unpacks it, and compares it with the
+  mmap'd GGUF source.
+
+The CLI exposes that production path as:
+
+```bash
+./build/release/ns upload MODEL.gguf --verify
+```
+
+### 2. CPU repack -> unpack gate
+
+Command:
+
+```bash
+./build/release/tests/test_repack
+```
+
+Synthetic coverage uses 35 rows (one full wave tile plus a 3-row tail) for all
+eleven known scalar/quant storage types and independently checks the documented
+plane/chunk order and 16-byte offsets. It also rejects unsupported types, partial
+blocks, null buffers, and overflowing shapes.
+
+Full-model result:
+
+| model | tensors | bytes compared | time | result |
+|---|---:|---:|---:|---|
+| Q4_K_XL | 866 | 17,548,181,504 | 7.222 s | bit-exact |
+| Q5_K_XL | 866 | 20,865,941,504 | 8.237 s | bit-exact |
+| **total** | **1,732** | **38,414,123,008** | **15.459 s** | **bit-exact** |
+
+The exact type census was Q4: F32 360, Q8_0 110, Q3_K 3, Q4_K 69, Q5_K 191,
+Q6_K 56, IQ4_NL 6, IQ3_S 1, IQ4_XS 70; Q5: F32 360, Q8_0 130, Q4_K 8,
+Q5_K 174, Q6_K 184, IQ4_NL 1, IQ4_XS 9. The test reports **122,472 checks**.
+
+### 3. Native GPU arena upload/readback gate
+
+Command:
+
+```bash
+./build/release/tests/test_gpu_upload
+```
+
+Both runs selected `AMD Radeon AI PRO R9700 (gfx1201)`, PCI `0000:03:00.0`, HIP
+index 0 by architecture scan. The display guard found **0 connected displays**.
+
+| model | exact tensor bytes | arena bytes | alignment | repack+upload | readback+unpack |
+|---|---:|---:|---:|---:|---:|
+| Q4_K_XL | 17,548,181,504 | 17,548,187,648 | 6,144 B | 6.148 s | 3.736 s |
+| Q5_K_XL | 20,865,941,504 | 20,865,947,648 | 6,144 B | 7.283 s | 4.740 s |
+
+Every one of 866 device slots per model was 256-byte aligned and non-overlapping.
+Every uploaded byte returned to the host and unpacked to the original GGUF bits.
+The test reports **6,952 checks**. The page-cached load times are comfortably below
+PLAN §5.4's <25 s warm target. They are load measurements, not decode benchmarks;
+the working-set rule does not apply, though each run naturally moved 17–21 GB.
+
+### 4. Final verification
+
+```bash
+make test
+git diff --check
+```
+
+All C++/HIP compilations used `--offload-arch=gfx1201` exactly. `test_gguf`,
+`test_gpu_upload`, `test_quants`, `test_repack`, `test_compare_gate.py`, and
+`test_compare_tokens.py` all PASS. No whitespace errors.
+
+**NEXT:** Stage 2 task 2 in PLAN order: add the fp32-dequant GPU GEMV variant over
+the repacked layout; validate random activations for every blessed format and every
+§6.3 shape against cpu_ref before any performance work. Then benchmark each shape
+with >=1 GB of distinct weights and tune toward the §6.3 streaming targets.
