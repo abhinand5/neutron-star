@@ -369,3 +369,88 @@ from llama.cpp via `llama-eval-callback` (the graph already tags `attn_norm`,
 first layer whose cosine drops. Element-wise comparison is required; summary
 statistics were not sufficient. Stage 2 stays blocked behind G1 (PLAN §0.3: do not
 start the next stage until the gate is green).
+
+---
+
+## 2026-08-22 — Session 3 (Stage 1: G1 root-cause, Claude Opus 5)
+
+**G1 is still RED, but by one token, and the catastrophic divergence is gone and
+root-caused.** The bug was never in ns.
+
+### 1. Root cause: llama.cpp quantizes activations; cpu_ref did not
+
+ggml sets `vec_dot_type = GGML_TYPE_Q8_K` for Q4_K/Q5_K/Q6_K/IQ4_XS
+(`ggml-cpu.c` type_traits_cpu): before every quantized matmul it converts the
+**activation** vector to int8 with one fp32 scale per 256 elements and does an
+integer dot. `cpu_ref` dequantized the weights exactly and dotted in fp32 — more
+accurate, but ~0.1–0.4% different per matmul, compounding over 64 layers.
+
+At layer 62 that drift met a heavily-cancelling dot product and flipped its sign
+(`attn_qkv` channel 4951: ns **+8.394** vs llama.cpp **−6.048**, while neighbouring
+channels agreed to 0.05). That fed GDN v-head 6, whose per-head RMSNorm amplified it
+to +104.75 against the oracle's −41.64, and the logits followed.
+
+`ns eval --ggml-act-quant` ports `quantize_row_q8_K_ref`. Effect on the worst prompt:
+
+| metric | exact fp32 | ggml-style | control (llama.cpp vs itself) |
+|---|---|---|---|
+| top-1 | 0.9333 | **0.9667** | 0.9667 |
+| cosine mean | 0.99718 | **0.99964** | 0.99967 |
+| cosine worst | **0.95580** | **0.99891** | 0.99905 |
+
+### 2. G1 status — 205 positions, 4 prompts
+
+| prompt | pos | ns top-1 | ns worst cos | control top-1 | control worst cos |
+|---|---|---|---|---|---|
+| p1 prose | 31 | 30/31 | 0.99918 | 31/31 | 0.99940 |
+| p2 code | 90 | 90/90 | 0.99779 | 90/90 | 0.99599 |
+| p3 literary | 54 | 54/54 | 0.99855 | 54/54 | 0.99801 |
+| p4 technical | 30 | 29/30 | 0.99891 | 29/30 | 0.99905 |
+| **total** | **205** | **203/205 = 0.9902** | 0.99779 | 204/205 = 0.9951 | 0.99599 |
+
+ns's cosine agreement now sits **inside** the reference's own reproducibility band —
+better than the control on p2 and p3, marginally worse on p1 and p4. Top-1 is
+**203/205 vs the control's 204/205**: ns misses two tokens, llama.cpp misses one
+against itself. The gate wants ≥ 0.995 (204/205), so ns is **one token short**.
+
+Remaining gap is almost certainly that `--ggml-act-quant` emulates only the
+*rounding* (quantize→dequantize→fp32 dot), not ggml's exact integer accumulation
+with per-block `bsums`/`dmin` correction. Implementing the true Q8_K × K-quant
+integer dot should close it — and PLAN §7.5 requires that path for the GPU kernels
+anyway, so it is not throwaway work.
+
+### 3. Tooling added (this is what made the bisect possible)
+
+- `tools/oracle_activations.cpp` — hooks llama.cpp's eval callback, captures any
+  tensor by name filter at one position, CPU-pinned with fp32 KV.
+- `ns eval --debug-pos N --dump-activations FILE` — same record format on the ns side.
+- `tools/compare_activations.py` — diffs by tensor name, reports per-layer cosine.
+- `quant_oracle --tensor NAME` — exhaustive per-block dequant check (used to clear
+  `blk.62.attn_qkv.weight`: **bit-exact across all 204800 blocks**).
+- `tests/prompts/` — the four parity prompts committed as durable fixtures; the
+  previous run's scratchpad was cleaned up mid-investigation and had to be rebuilt.
+
+### 4. Bisect trail (reusable recipe)
+
+`l_out-*` residual ≥0.9996 through L58 → 0.9943 (L61) → **0.7769 (L62)** → 0.5233
+(L63), concentrated in channel 3994. Sublayer: `linear_attn_out-61` 0.9987 →
+**`linear_attn_out-62` 0.414**. Inside GDN 62: state ✓, q/k/v ✓, beta ✓, raw delta
+output 46/48 heads ≥0.99, but `final_output` 0.018 from one blown-up head. Up the
+chain to qkv channel 4951, then to ggml's `vec_dot_type`.
+
+**Two traps, both recorded in DECISIONS D7:** ggml stores the GDN state *transposed*
+(`s_out[j*S+i] = S[i][j]`) — comparing it element-wise reads as cosine 0.02 when it
+is actually 0.9996; and ns's `conv_output_silu` dump showed a uniform rms of
+1/sqrt(128) per head, which was a diagnostic artifact (q/k alias into the conv buffer,
+so the in-place L2-norm ran before the dump), not a bug.
+
+**Also corrected:** session 2's inference that the divergence was "structural, not
+numerical" (from the double-accumulation test) was wrong. Perturbing one engine's
+precision only shows that engine is internally stable; it cannot rule out a numerical
+difference living in the other one.
+
+**NEXT:** implement the real Q8_K × K-quant integer dot in cpu_ref (matching
+`ggml_vec_dot_q5_K_q8_K` et al., including `bsums`/`dmin` handling) and re-run the
+205-position sweep. That is the last known gap between ns and the oracle, and it is
+the same arithmetic PLAN §7.5 specifies for the Stage 2 GEMV kernels. Stage 2 stays
+blocked behind G1.
