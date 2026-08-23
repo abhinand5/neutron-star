@@ -562,3 +562,30 @@ tokenizer (§4.5, currently shelling out to `llama-tokenize`); `tools/compare.py
 layer-bisect mode; Stage 2 scaffolding that does not touch numerics (VRAM arena,
 §5.4 repack + its round-trip test, kernel launch-config table). Stage 2's *kernels*
 stay blocked behind G1 per §0.3.
+---
+
+## 2026-08-23 — Session 4 (escalation review, Claude Fable 5)
+
+The 2026-08-22 ESCALATE (G1 one token short) is **resolved by ruling, not by code**:
+see **DECISIONS.md D8** for the full reasoning. Summary:
+
+- **Option (b), strengthened.** G1's top-1 criterion becomes *triangulated
+  agreement* (a miss = ns disagrees with both the stepwise and batched reference
+  paths) plus a **margin guard** (every miss must be a < 0.25-logit near-tie, also
+  smaller than the reference's own cross-config drift on the contested pair). Not
+  the proposed "±1 token" — that would have been a loosened constant. Threshold
+  stays ≥ 99.5%.
+- On the existing data this scores 204/205 = 0.9951 → **G1 expected GREEN**, but the
+  gate is declared only after `tools/compare.py` implements the rule and the
+  205-position sweep is re-run.
+- **Option (a) — the true Q8_K × K-quant integer dot — is Stage 2 task 0**, not a
+  G1 blocker: PLAN §7.5 needs that arithmetic for the GPU GEMV kernels anyway, so
+  cpu_ref grows it first and becomes the kernels' row-level oracle. Informational
+  re-sweep afterwards; no re-gating.
+- **Option (c) rejected** — llama.cpp as independent bit-oracle is what caught D5
+  and D7; exact-fp32 self-parity would have caught neither.
+
+**NEXT (one session, bounded):** extend `tools/compare.py` per D8 (triangulated
+top-1 + margin guard, raw number still reported), re-run the escalation §4 sweep,
+record the table here, declare G1, then start Stage 2 with task 0 = Q8_K integer
+dot in cpu_ref verified against `ggml_vec_dot_*_q8_K`.

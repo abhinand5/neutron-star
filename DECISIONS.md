@@ -397,3 +397,68 @@ per-layer activations from llama.cpp via `llama-eval-callback` (cb names
 ns via `ns eval --debug-pos 19`, then find the first layer whose cosine drops. That
 layer is the bug's home. Statistics alone were not enough: ns's per-layer rms/min/max
 look entirely healthy, so the comparison has to be element-wise against the oracle.
+
+---
+
+## D8 — ESCALATION RESOLVED: G1 top-1 becomes triangulated agreement with a margin guard; true Q8_K integer dot moves to Stage 2 task 0
+
+**Date:** 2026-08-23 (Stage 1 → 2 boundary, escalation review, Claude Fable 5)
+**Amends:** PLAN §8 gate G1 / §9.2 (top-1 criterion). Extends D6. Answers the
+2026-08-22 ESCALATE entry in PROGRESS.md.
+
+**Ruling: option (b), but with a stricter formulation than proposed, plus a
+safeguard; option (a) is kept but re-scheduled as Stage 2 task 0; option (c) is
+rejected.**
+
+### The amended top-1 criterion
+
+Not "±1 token" — that is exactly the loosened constant D6 refused to be. Instead,
+D6's principle extended to top-1:
+
+1. **Triangulated agreement.** A position counts as a miss only if ns's argmax
+   differs from **both** reference configurations (CPU stepwise *and* CPU batched).
+   Where llama.cpp's two paths disagree with each other, the oracle has no answer at
+   that position; matching either path is inside the reference's own reproducibility
+   band. This is the same triangulation that convicted ns in session 2 (p4 pos 19:
+   both ref paths agreed, ns disagreed with both) — applied symmetrically, it must
+   also be allowed to acquit.
+2. **Margin guard (the anti-rationalisation clause).** Every remaining miss must be
+   a demonstrated near-tie: ns's losing margin on the contested token pair must be
+   `< 0.25` logits **and** smaller than the reference's own cross-config drift on
+   those same tokens (`max |logit_step − logit_batch|` over the contested pair). A
+   real bug cannot hide here — the pre-D7 miss had a ~14-logit swing; the guard
+   admits only coin-flips.
+3. Threshold stays **≥ 99.5%** on ≥ 192 positions, applied to triangulated
+   agreement. Cosine per D6, unchanged. Greedy-continuation criterion unchanged,
+   evaluated with the same triangulation (either ref path).
+
+Applied to the existing 205-position data: p4 pos 29 — ns agrees with the batched
+path, not a miss. p1 pos 9 — ns disagrees with both, margin 0.0006 < 0.25 and < the
+0.20 cross-config drift on token 733: an admissible near-tie miss. Score **204/205
+= 0.9951 → G1 GREEN** once `tools/compare.py` implements the rule and the sweep is
+re-run (do that; do not mark the gate green from this arithmetic alone).
+
+### Why not (a) now, and why not (c) at all
+
+**(a) is deferred, not dropped.** The true `Q8_K × K-quant` integer dot
+(`ggml_vec_dot_q5_K_q8_K` et al., int32 accumulation, `bsums`/`dmin` correction) is
+required by PLAN §7.5 for the Stage 2 GPU GEMV kernels regardless. Sequencing it as
+**Stage 2 task 0** — implemented in cpu_ref first, verified against ggml's own
+`vec_dot` per row — turns it from gate-grinding into the row-level oracle the GPU
+kernels need anyway. After it lands, re-run the 205 sweep as an *informational*
+check (expected ≥ 204/205); G1 does not re-block on it. The escalation's risk note
+was right: a third consecutive "one more step and it closes" is not how a gate
+should be crossed when the two residual misses are provably inside oracle noise.
+
+**(c) is rejected.** Re-targeting parity at exact-fp32 discards the only
+*independent* implementation we can compare against. llama.cpp-as-bit-oracle caught
+D5's two plan errors and D7; an exact-fp32 target would have caught neither, because
+ns would be graded against its own assumptions.
+
+### Instruction to the next session
+
+Extend `tools/compare.py`: top-1 counts agreement against ref **or** control;
+report raw and triangulated numbers side by side (the raw number must stay visible
+— drift in it is still a signal); print the contested-pair margins for every miss
+and hard-fail any miss violating the margin guard. Re-run the §4-of-the-escalation
+sweep, record the table in PROGRESS.md, declare G1, proceed to Stage 2 task 0.
