@@ -103,7 +103,7 @@ $(ORACLE_BINS): $(BUILDDIR)/tools/%: tools/%.cpp
 $(BUILDDIR)/tools/%: tools/%.cpp $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) \
-	  -L$(GGML_LIBDIR) -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@
+	  -L$(GGML_LIBDIR) -lggml-cpu -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@
 
 clean:
 	rm -rf build

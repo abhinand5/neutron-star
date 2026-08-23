@@ -49,6 +49,7 @@ static void test_layouts() {
     CHECK(sizeof(block_q5_K) == 176);
     CHECK(sizeof(block_q6_K) == 210);
     CHECK(sizeof(block_q8_0) == 34);
+    CHECK(sizeof(block_q8_K) == 292);
     CHECK(sizeof(block_iq4_nl) == 18);
     CHECK(sizeof(block_iq4_xs) == 136);
     CHECK(sizeof(block_iq3_s) == 110);
@@ -168,6 +169,60 @@ static void test_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Self-contained coverage for Stage 2's Q8_K x K-quant integer row oracle.
+// tools/quant_oracle performs the exact comparison with ggml; this local test
+// checks every supported format against the equivalent dequantized dot so the
+// paths stay exercised without llama.cpp or model files.
+// ---------------------------------------------------------------------------
+static void test_q8_K_dots() {
+    std::vector<float> zeros(QK_K, 0.0f);
+    block_q8_K zero_block;
+    memset(&zero_block, 0x7f, sizeof(zero_block));
+    quantize_row_q8_K(zeros.data(), &zero_block, QK_K);
+    CHECK(zero_block.d == 0.0f);
+    for (int i = 0; i < QK_K; i++) CHECK(zero_block.qs[i] == 0);
+    for (int i = 0; i < QK_K / 16; i++) CHECK(zero_block.bsums[i] == 0);
+
+    for (int fixture = 0; fixture < k_n_golden_quants; fixture++) {
+        const GoldenQuant& golden = k_golden_quants[fixture];
+        if (!has_vec_dot_q8_K(golden.type)) continue;
+        std::vector<float> activation((size_t)golden.n_elem);
+        for (int64_t i = 0; i < golden.n_elem; i++) {
+            activation[(size_t)i] =
+                0.7f * sinf(0.031f * (float)(i + 1)) +
+                0.2f * cosf(0.017f * (float)(i + 3));
+        }
+        std::vector<block_q8_K> q8((size_t)(golden.n_elem / QK_K));
+        quantize_row_q8_K(activation.data(), q8.data(), golden.n_elem);
+        for (const block_q8_K& block : q8) {
+            for (int group = 0; group < QK_K / 16; group++) {
+                int sum = 0;
+                for (int j = 0; j < 16; j++) sum += block.qs[group * 16 + j];
+                CHECK(block.bsums[group] == sum);
+            }
+        }
+
+        float integer_result = 0.0f;
+        CHECK(vec_dot_q8_K(golden.type, golden.raw, q8.data(), golden.n_elem,
+                           &integer_result));
+        std::vector<float> weights((size_t)golden.n_elem);
+        CHECK(dequant_row(golden.type, golden.raw, weights.data(), golden.n_elem));
+        double dequantized_result = 0.0;
+        for (int64_t i = 0; i < golden.n_elem; i++) {
+            const block_q8_K& block = q8[(size_t)(i / QK_K)];
+            const float q8_value = block.d * block.qs[i % QK_K];
+            dequantized_result += (double)weights[(size_t)i] * q8_value;
+        }
+        const double tolerance = 2e-4 * std::max(1.0, fabs(dequantized_result));
+        CHECK(fabs((double)integer_result - dequantized_result) <= tolerance);
+        CHECK(std::isfinite(integer_result));
+    }
+    float ignored = 0.0f;
+    CHECK(!vec_dot_q8_K(NS_Q8_0, nullptr, &zero_block, QK_K, &ignored));
+    CHECK(!vec_dot_q8_K(NS_IQ4_NL, nullptr, &zero_block, QK_K, &ignored));
+}
+
+// ---------------------------------------------------------------------------
 // If the weights are present, dequantize a whole row of every type actually
 // used and sanity-check the distribution. Skipped when the model is absent.
 // ---------------------------------------------------------------------------
@@ -211,6 +266,8 @@ int main() {
     test_scale_min_k4();
     printf("  dispatch...\n");
     test_dispatch();
+    printf("  Q8_K integer row dots...\n");
+    test_q8_K_dots();
     printf("  golden blocks vs llama.cpp...\n");
     test_golden();
     printf("  real model rows...\n");

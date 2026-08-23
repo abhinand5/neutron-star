@@ -589,3 +589,188 @@ see **DECISIONS.md D8** for the full reasoning. Summary:
 top-1 + margin guard, raw number still reported), re-run the escalation §4 sweep,
 record the table here, declare G1, then start Stage 2 with task 0 = Q8_K integer
 dot in cpu_ref verified against `ggml_vec_dot_*_q8_K`.
+
+---
+
+## 2026-08-23 — Session 5 (G1 GREEN + Stage 2 task 0, GPT-5.6 Sol)
+
+**G1 is GREEN, with every clause now executable. Stage 2 task 0 is complete.**
+
+### 1. Session start and review of the D8 gate implementation
+
+Read PLAN Part 0/8/13, the latest PROGRESS/DECISIONS entries, and the 2026-08-23
+handoff. Hardware discovery still reports the R9700 as native `gfx1201`; no override
+was set. Baseline command:
+
+```bash
+rocminfo | rg 'Name:.*gfx|Marketing Name:'
+make && make test
+```
+
+The build used `--offload-arch=gfx1201` and all existing tests passed. A two-axis
+review of commit `3688661` found four material gate-harness issues before G1 was
+declared:
+
+1. `--guard-side` defaulted to the unrecorded strict reading, not D8's rule.
+2. `greedy_ok = all(triangulated)` made every admissible near-tie force RED, so the
+   margin guard could never actually admit anything.
+3. The supposed greedy check compared argmaxes from teacher-forced prompt rows; it
+   never fed a selected token back into either engine.
+4. The synthetic test ignored subprocess return codes, so its nominal good case was
+   actually exiting 1/RED while the test printed PASS.
+
+Fixes: `tools/compare.py` now streams one vocabulary row at a time, requires the
+control dump and equal row counts, aggregates repeated `--case` triples, enforces
+the >=192-position sample, defaults to D9's ns-side margin, and labels greedy as
+not tested. The regression test now checks GREEN/RED exit codes, including an exact
+p1-shaped asymmetric case and a 14-logit confidently-wrong case. `make test` also
+runs the new whole-path `tools/compare_tokens.py` test.
+
+### 2. D8 disambiguated → D9
+
+The user explicitly asked this GPT-5.6 Sol session to make the call without another
+advisor. **D9 adopts ns's own margin**, because D8 says "ns's" and its worked p1
+example can only be the 0.0006 ns-side gap. `--guard-side both` remains a diagnostic.
+Full rationale is in DECISIONS D9.
+
+The complete preserved sweep was evaluated in one process (paths abbreviated here
+only by the exact `D` variable):
+
+```bash
+D=$HOME/.cache/neutron-star/parity-205
+python3 tools/compare.py "$D/p1_ns_q.bin" "$D/p1_ref_step.bin" \
+  --control "$D/p1_ref_batch.bin" --case-label p1 \
+  --case p2 "$D/p2_ns_q.bin" "$D/p2_ref_step.bin" "$D/p2_ref_batch.bin" \
+  --case p3 "$D/p3_ns_q.bin" "$D/p3_ref_step.bin" "$D/p3_ref_batch.bin" \
+  --case p4 "$D/p4_ns_q.bin" "$D/p4_ref_step.bin" "$D/p4_ref_batch.bin" \
+  --vocab 248320 --guard-side ns
+# repeated with: --guard-side both
+```
+
+| prompt | pos | raw top-1 | triangulated | ns worst cos | control worst |
+|---|---:|---:|---:|---:|---:|
+| p1 prose | 31 | 30/31 | 30/31 | 0.99917888 | 0.99939810 |
+| p2 code | 90 | 90/90 | 90/90 | 0.99779370 | 0.99598770 |
+| p3 literary | 54 | 54/54 | 54/54 | 0.99855163 | 0.99801422 |
+| p4 technical | 30 | 29/30 | 30/30 | 0.99890521 | 0.99904758 |
+| **total** | **205** | **203/205 = 0.9902** | **204/205 = 0.9951** | **0.99779370** | **0.99598770** |
+
+Aggregate mean cosine = **0.99954504** (control **0.99954449**); mean top-5
+overlap = **0.9659**. The only triangulated miss is p1 pos 9: ns margin **0.0006**,
+reference gap **0.2013**, reference drift **0.0606**. Adopted D9 guard: GREEN;
+strict both-sides diagnostic: RED. The raw number remains visible.
+
+### 3. Real 64-token greedy continuations (the missing G1 clause)
+
+Added `ns eval --generate N --dump-tokens FILE` and the same flags to
+`oracle_logits`; each engine feeds its own argmax back into its own recurrent/KV
+state. `compare_tokens.py` accepts a complete match to either complete D8 reference
+path, never a per-position weave across incompatible contexts.
+
+For p1/p2/p3, the first 12 committed prompt tokens were used. Commands were this
+form, with `TOK` and `P` changed for each prompt and `--batched` added for the
+control run:
+
+```bash
+M=$HOME/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf
+OMP_NUM_THREADS=8 ./build/release/ns eval "$M" --tokens "$TOK" \
+  --ggml-act-quant --generate 64 --dump-tokens "/tmp/ns_${P}_greedy.bin"
+OMP_NUM_THREADS=8 ./build/release/tools/oracle_logits -m "$M" -t "$TOK" \
+  --generate 64 --dump-tokens "/tmp/ref_step_${P}_greedy.bin"
+OMP_NUM_THREADS=8 ./build/release/tools/oracle_logits -m "$M" -t "$TOK" \
+  --batched --generate 64 --dump-tokens "/tmp/ref_batch_${P}_greedy.bin"
+python3 tools/compare_tokens.py "/tmp/ns_${P}_greedy.bin" \
+  "/tmp/ref_step_${P}_greedy.bin" "/tmp/ref_batch_${P}_greedy.bin"
+```
+
+| prompt | generated | ns == stepwise | ns == batched | refs equal | verdict |
+|---|---:|---:|---:|---:|---:|
+| p1 prose | 64 | yes | no (first diff 26) | no | GREEN |
+| p2 code | 64 | yes | yes | yes | GREEN |
+| p3 literary | 64 | yes | yes | yes | GREEN |
+
+Thus all three greedy continuations are **64/64 identical to a complete reference
+path**. Together with §2: **G1 GREEN at 204/205 = 0.9951**, cosine inside D6's
+reference band, and 3 x 64 exact greedy tokens.
+
+### 4. Stage 2 task 0 — true Q8_K x K-quant integer row dot
+
+Implemented `src/vec_dot.cpp`, copied from the pinned generic ggml arithmetic for
+all Q8_K-backed formats in the blessed files:
+
+```
+Q3_K  Q4_K  Q5_K  Q6_K  IQ3_S  IQ4_XS
+```
+
+`block_q8_K` is 292 bytes (`float d`, 256 signed quants, 16 int16 block sums).
+Q4_K/Q5_K include the exact `bsums * dmin` correction. `cpu_ref` now quantizes an
+activation once per K-quant matvec and uses the integer dot for every output row;
+the exact-fp32 dequant path remains the default when `--ggml-act-quant` is absent.
+
+The oracle initializes ggml-cpu's fp16 table, proves ns Q8_K bytes equal
+`quantize_row_q8_K_ref`, then compares first/middle/last rows of every eligible
+matrix against `ggml_vec_dot_*_q8_K_generic`:
+
+```bash
+make tools && ./build/release/tools/quant_oracle
+```
+
+| model | eligible tensors | rows | elements | max abs dot diff |
+|---|---:|---:|---:|---:|
+| Q4_K_XL | 390 | 1,170 | 8,524,800 | 2.68220901e-06 |
+| Q5_K_XL | 375 | 1,125 | 8,355,840 | 4.05311584e-06 |
+| **total** | **765** | **2,295** | **16,880,640** | **4.05311584e-06** |
+
+The integer products and Q8_K bytes are exact. 1,270 final fp32 results differ in
+the low bits because the x86 ggml build auto-vectorizes its final lane reduction;
+all 2,295 rows pass the tight absolute tolerance. Existing dequant coverage also
+remains bit-exact: 32,768 random blocks plus 4,889,856 real-model elements.
+
+### 5. Required post-task informational sweep
+
+Regenerated only ns's four dumps with the new integer path (the durable references
+were reused):
+
+```bash
+for P in p1 p2 p3 p4; do
+  NS_PARITY_TOKENS=$(tr -d '\n' < "tests/prompts/${P}.tokens")
+  OMP_NUM_THREADS=8 ./build/release/ns eval "$M" --tokens "$NS_PARITY_TOKENS" \
+    --ggml-act-quant --dump-logits "/tmp/ns_int_${P}.bin"
+done
+# same aggregate compare command as §2, substituting /tmp/ns_int_p?.bin
+```
+
+| prompt | pos | raw top-1 | triangulated | ns worst cos |
+|---|---:|---:|---:|---:|
+| p1 | 31 | 31/31 | 31/31 | 0.99933207 |
+| p2 | 90 | 90/90 | 90/90 | 0.99852374 |
+| p3 | 54 | 53/54 | 53/54 | 0.99860195 |
+| p4 | 30 | 28/30 | 29/30 | 0.99865720 |
+| **total** | **205** | **202/205 = 0.9854** | **203/205 = 0.9902** | **0.99852374** |
+
+Mean cosine improved to **0.99957475**, but top-1 is one below D8's informational
+expectation of >=204/205. Both residual triangulated misses pass the D9 margin
+guard: p3 pos 6 = **0.2129 < 0.6535** drift; p4 pos 10 = **0.0105 < 0.0746**
+drift. Per D8 this informational result **does not re-block G1**. The exact row
+arithmetic is independently validated above; this is accumulated full-model drift,
+not evidence to weaken or alter the row oracle.
+
+The integer path also reduced observed CPU-reference time from ~2.45 s/token for
+quantize-dequantize-double-dot to **0.74–1.11 s/token** during this sweep. This is an
+observation, not a Stage 2 performance claim.
+
+### 6. Final verification and next task
+
+```bash
+git diff --check
+make && make tools && make test
+./build/release/tools/quant_oracle
+```
+
+Results: no whitespace errors; release build clean; `test_gguf`, `test_quants`,
+`test_compare_gate.py`, and `test_compare_tokens.py` all PASS; quant oracle PASS
+with the counts above.
+
+**NEXT:** Stage 2 task 1 in PLAN order: VRAM arena + bit-preserving per-format
+repack/upload, with repack -> unpack bit-exact tests. Re-read PLAN Part 2 and §7
+before touching HIP; retain the R9700 display guard and select by `gcnArchName`.

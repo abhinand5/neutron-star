@@ -95,54 +95,14 @@ static inline float sigmoidf(float x){ return 1.0f / (1.0f + expf(-x)); }
 static inline float softplus(float x){ return x > 20.0f ? x : logf(1.0f + expf(x)); }
 
 // ---------------------------------------------------------------------------
-// Optional: emulate llama.cpp's activation quantization.
+// Optional: match llama.cpp's Q8_K x K-quant integer arithmetic.
 //
 // For Q4_K/Q5_K/Q6_K/IQ4_XS, ggml sets vec_dot_type = GGML_TYPE_Q8_K, i.e. it
-// quantizes the *activation* vector to int8 (per-256 block scale) and does an
-// integer dot product. cpu_ref instead dequantizes the weights exactly and dots
-// in fp32, which is more accurate but numerically different — and that
-// difference, compounded over 64 layers, is what separates ns from the oracle
-// (DECISIONS.md D7). Turning this on rounds the activation the same way ggml
-// does, so parity measures ns's *logic* rather than ns's superior arithmetic.
-//
-// Port of quantize_row_q8_K_ref (ggml-quants.c): iscale = -127/max, where max is
-// the signed value of largest magnitude, then q = min(127, nearest_int(iscale*x)).
+// quantizes the activation to Q8_K and accumulates the integer product, including
+// Q4_K/Q5_K bsums/dmin correction. This is Stage 2's row-level GEMV oracle
+// (DECISIONS.md D7/D8); the exact-fp32 dequant-and-dot path remains the default.
 static bool g_act_quant = false;
 void ref_set_act_quant(bool on) { g_act_quant = on; }
-
-static inline int nearest_int_ns(float fval) {
-    // ggml's nearest_int: assumes |fval| <= 4194303
-    float val = fval + 12582912.f;
-    int i;
-    memcpy(&i, &val, sizeof(int));
-    return (i & 0x007fffff) - 0x00400000;
-}
-
-static void quantize_act_q8_K(const float* x, float* y, int64_t k) {
-    const int64_t nb = k / 256;
-    for (int64_t i = 0; i < nb; i++) {
-        const float* xb = x + i * 256;
-        float* yb = y + i * 256;
-        float amax = 0.f, mx = 0.f;
-        for (int j = 0; j < 256; ++j) {
-            const float ax = fabsf(xb[j]);
-            if (ax > amax) { amax = ax; mx = xb[j]; }
-        }
-        if (amax == 0.f) {
-            for (int j = 0; j < 256; ++j) yb[j] = 0.f;
-            continue;
-        }
-        const float iscale = -127.f / mx;
-        const float d = 1.f / iscale;
-        for (int j = 0; j < 256; ++j) {
-            int v = nearest_int_ns(iscale * xb[j]);
-            if (v > 127) v = 127;
-            yb[j] = (float)v * d;      // quantize then dequantize
-        }
-    }
-    // tail elements (k not a multiple of 256) pass through unchanged
-    for (int64_t i = nb * 256; i < k; i++) y[i] = x[i];
-}
 
 static inline size_t row_bytes(const GgufTensor& t) {
     const TypeInfo& ti = type_info(t.type);
@@ -178,27 +138,29 @@ static void matvec(const GgufTensor& w, const float* x, float* y) {
     const int32_t type = w.type;
     const uint8_t* base = w.data;
 
-    // round the activation the way ggml would, when asked to
-    std::vector<float> xq;
-    if (g_act_quant && type_info(type).blck == 256) {
-        xq.resize((size_t)k);
-        quantize_act_q8_K(x, xq.data(), k);
-        x = xq.data();
+    const bool integer_dot = g_act_quant && has_vec_dot_q8_K(type);
+    std::vector<block_q8_K> xq;
+    if (integer_dot) {
+        xq.resize((size_t)(k / QK_K));
+        quantize_row_q8_K(x, xq.data(), k);
     }
 #pragma omp parallel
     {
-        std::vector<float> row((size_t)k);
+        std::vector<float> row(integer_dot ? 0 : (size_t)k);
 #pragma omp for schedule(static)
         for (int64_t j = 0; j < n; j++) {
-            dequant_row(type, base + (size_t)j * rb, row.data(), k);
-            // Accumulate in double. ggml's quantized vec_dot sums per 32/256-element
-            // block in float and then combines, so its error grows ~log(k); a naive
-            // sequential float sum over k up to 17408 grows ~k and leaves cpu_ref
-            // measurably noisier than the oracle it is supposed to arbitrate.
-            // This is the in-repo reference: precision is the point.
-            double s = 0.0;
-            for (int64_t i = 0; i < k; i++) s += (double)row[(size_t)i] * (double)x[i];
-            y[j] = (float)s;
+            const uint8_t* weight_row = base + (size_t)j * rb;
+            if (integer_dot) {
+                const bool supported = vec_dot_q8_K(type, weight_row, xq.data(), k, &y[j]);
+                NS_CHECK(supported, "missing Q8_K dot for %s", type_info(type).name);
+            } else {
+                dequant_row(type, weight_row, row.data(), k);
+                // The exact-fp32 reference path deliberately accumulates in double.
+                double sum = 0.0;
+                for (int64_t i = 0; i < k; i++)
+                    sum += (double)row[(size_t)i] * (double)x[i];
+                y[j] = (float)sum;
+            }
         }
     }
 }

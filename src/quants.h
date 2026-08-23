@@ -90,6 +90,16 @@ struct block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == 34, "block_q8_0 layout");
 
+// Intermediate activation format used by K-quant integer dot products. This is
+// not stored in GGUF: one fp32 scale and signed int8 values per 256 elements,
+// plus 16-element sums for Q4_K/Q5_K's dmin correction.
+struct block_q8_K {
+    float   d;
+    int8_t  qs[QK_K];
+    int16_t bsums[QK_K / 16];
+};
+static_assert(sizeof(block_q8_K) == 292, "block_q8_K layout");
+
 struct block_iq4_nl {
     ns_half d;
     uint8_t qs[QK4_NL / 2];
@@ -336,5 +346,13 @@ static inline void dequant_row_bf16(const uint16_t* x, float* y, int64_t k) {
 // (PLAN §5.3: "the loader must hard-fail on any type it cannot decode").
 // ---------------------------------------------------------------------------
 bool dequant_row(int32_t type, const void* src, float* dst, int64_t k);
+
+// Stage 2 task 0: exact ggml-style Q8_K activation quantization and integer dot
+// for the six K-block formats used by the blessed models. Returns false for a
+// type whose ggml vec_dot_type is not Q8_K (e.g. Q8_0 and IQ4_NL use Q8_0).
+void quantize_row_q8_K(const float* src, block_q8_K* dst, int64_t k);
+bool vec_dot_q8_K(int32_t weight_type, const void* weights,
+                  const block_q8_K* activations, int64_t k, float* result);
+bool has_vec_dot_q8_K(int32_t weight_type);
 
 }  // namespace ns

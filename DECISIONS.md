@@ -462,3 +462,58 @@ report raw and triangulated numbers side by side (the raw number must stay visib
 — drift in it is still a signal); print the contested-pair margins for every miss
 and hard-fail any miss violating the margin guard. Re-run the §4-of-the-escalation
 sweep, record the table in PROGRESS.md, declare G1, proceed to Stage 2 task 0.
+
+---
+
+## D9 — D8's margin is measured on ns logits; greedy continuation is a separate whole-path gate
+
+**Date:** 2026-08-23 (Stage 1 → 2 boundary)
+**Clarifies:** D8's phrase "ns's losing margin" and its greedy-continuation clause.
+**Authority:** the user explicitly asked the executing GPT-5.6 Sol agent to make
+the call without another advisor in the 2026-08-23 continuation session.
+
+### Margin ruling
+
+The G1 margin guard uses **ns's own conviction** on the contested pair:
+`logit_ns[ns_argmax] - logit_ns[ref_argmax]`. The optional `--guard-side both`
+reading remains available as a stricter diagnostic, but it is not the gate.
+
+This is not choosing the side that happens to pass. It is the only reading that
+matches both pieces of evidence D8 itself supplies:
+
+1. the rule explicitly says **"ns's"** margin; and
+2. D8's worked p1 position 9 calls the **0.0006** ns-side gap admissible. The
+   reference-side gap is 0.2013, so a both-sides maximum cannot produce D8's stated
+   result.
+
+The anti-rationalisation property remains intact: a confidently wrong ns has a
+large ns-side margin and fails. The synthetic regression test includes the pre-D7
+14-logit signature and verifies a nonzero/RED process result. It also includes the
+exact asymmetric p1 shape and verifies that the adopted reading is GREEN while the
+both-sides diagnostic is RED.
+
+### Gate-harness correction and greedy interpretation
+
+Review of D8's implementation found that `tools/compare.py` called the argmaxes of
+teacher-forced prompt rows a "greedy continuation" and required every row to
+triangulate. That made **any** admissible residual miss force RED, contradicting
+D8's explicit 204/205 GREEN result; the original test inspected strings but ignored
+the subprocess exit code, so it missed the contradiction.
+
+Teacher-forced logit parity and autoregressive continuation are now separate:
+
+- `tools/compare.py` streams and aggregates the 205 fixed-context rows, requires
+  both reference paths and at least 192 positions, and applies D6/D8/D9.
+- `ns eval --generate N` and `oracle_logits --generate N` feed each chosen token
+  back into their own state. `tools/compare_tokens.py` requires ns's complete
+  continuation to equal either complete reference path. It does not allow
+  per-position weaving after the reference contexts diverge.
+
+### G1 verdict
+
+**G1 is GREEN.** The aggregate fixed-context result is 204/205 = 0.9951
+triangulated, with the sole residual miss at p1 position 9 passing the D9 margin
+guard (0.0006 < 0.0606 reference drift). Worst ns cosine is 0.99779370 against the
+D6 control floor 0.99598770. Three mixed prompts then produced 64/64-token greedy
+continuations: ns matched the complete stepwise reference path in all three; the
+batched path also matched on p2/p3 and diverged from ns/stepwise at p1 token 26.

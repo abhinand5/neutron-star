@@ -1,252 +1,368 @@
 #!/usr/bin/env python3
-"""Compare two logit dumps — the Stage 1 parity gate (PLAN §9.2, gate G1).
+"""Compare logit dumps for the Stage 1 parity gate (PLAN §9.2, G1).
 
-Both files are raw little-endian fp32: n_positions * n_vocab values, written in
-position order. ns writes them with `ns eval --dump-logits`; the llama.cpp side
-comes from tools/oracle_logits.
+Inputs are raw little-endian fp32 rows with ``n_vocab`` values per position.
+The primary reference is llama.cpp CPU stepwise decode; each comparison also
+requires the CPU batched control used by DECISIONS.md D6/D8.
 
-Gate G1, as amended by DECISIONS.md D6 and D8:
+D8 changes top-1 scoring in two ways:
 
-  * cosine   — bar is min(configured, control_worst): ns must match the reference
-               at least as well as the reference matches itself (D6).
-  * top-1    — TRIANGULATED agreement (D8): a position is a miss only when ns's
-               argmax differs from BOTH reference configurations. Where the two
-               reference paths disagree with each other, the oracle has no answer
-               at that position and matching either one is inside its own
-               reproducibility band. Threshold stays >= 99.5%.
-  * margin   — the anti-rationalisation clause (D8): every remaining miss must be
-               a demonstrated near-tie. ns's losing margin on the contested token
-               pair must be < 0.25 logits AND smaller than the reference's own
-               cross-config drift on those same tokens. A real bug cannot hide
-               here: the pre-D7 defect showed a ~14-logit swing.
+* ns agrees when its argmax matches either reference configuration;
+* every remaining miss must have an ns-side margin below 0.25 logits and below
+  the reference's cross-configuration drift on the contested pair.
 
-The RAW (untriangulated) top-1 number is always reported too — drift in it is
-still a signal, even when the triangulated number passes.
+The raw agreement with the primary reference remains visible. Multiple
+``--case`` triples are processed one at a time so the complete 192+ position
+gate can be evaluated without retaining all three multi-gigabyte dumps in RAM.
 
-usage:
-  tools/compare.py ns.bin oracle.bin --vocab 248320
-  tools/compare.py ns.bin oracle.bin --vocab 248320 --control ref_batch.bin --verbose
+This tool evaluates teacher-forced logit parity. It deliberately does not call
+that a greedy-continuation test: generated tokens must be fed back into each
+engine and checked separately for PLAN's continuation criterion.
 """
-import argparse, struct, sys, math
+
+import argparse
+import math
+import os
+import struct
+import sys
 
 
-def read_logits(path, vocab):
-    with open(path, "rb") as f:
-        raw = f.read()
-    n = len(raw) // 4
-    if n % vocab:
-        sys.exit(f"{path}: {n} floats is not a multiple of vocab {vocab}")
-    npos = n // vocab
-    vals = struct.unpack("<%df" % n, raw)
-    return [vals[i * vocab:(i + 1) * vocab] for i in range(npos)]
+MIN_GATE_POSITIONS = 192
+MAX_ADMISSIBLE_MARGIN = 0.25
 
 
-def topk(v, k):
-    return sorted(range(len(v)), key=lambda i: v[i], reverse=True)[:k]
+class LogitReader:
+    """Sequential reader that holds one vocabulary row in memory at a time."""
+
+    def __init__(self, path, vocab):
+        self.path = path
+        self.row_struct = struct.Struct("<%df" % vocab)
+        size = os.path.getsize(path)
+        if size % self.row_struct.size:
+            raise ValueError(
+                "%s: %d bytes is not a multiple of row size %d"
+                % (path, size, self.row_struct.size)
+            )
+        self.npos = size // self.row_struct.size
+        self.file = open(path, "rb")
+
+    def read(self):
+        raw = self.file.read(self.row_struct.size)
+        if len(raw) != self.row_struct.size:
+            raise ValueError("%s: short read" % self.path)
+        return self.row_struct.unpack(raw)
+
+    def close(self):
+        self.file.close()
 
 
-def margin(v, tok_a, tok_b):
-    """Signed margin of tok_a over tok_b in logit vector v."""
-    return v[tok_a] - v[tok_b]
+def topk(values, k):
+    return sorted(range(len(values)), key=lambda i: values[i], reverse=True)[:k]
 
 
-def stats(a, b, k):
-    # cosine, max abs diff, top-1 match, top-k overlap
-    dot = na = nb = 0.0
-    maxd = 0.0
-    argmax_d = -1
-    for i, (x, y) in enumerate(zip(a, b)):
+def margin(values, winner, loser):
+    """Positive conviction for ``winner`` over ``loser`` in one logit row."""
+    return values[winner] - values[loser]
+
+
+def stats(lhs, rhs, k):
+    dot = norm_lhs = norm_rhs = 0.0
+    max_diff = 0.0
+    max_diff_at = -1
+    for i, (x, y) in enumerate(zip(lhs, rhs)):
         dot += x * y
-        na += x * x
-        nb += y * y
-        d = abs(x - y)
-        if d > maxd:
-            maxd, argmax_d = d, i
-    cos = dot / (math.sqrt(na) * math.sqrt(nb)) if na and nb else 0.0
-    ta, tb = topk(a, k), topk(b, k)
+        norm_lhs += x * x
+        norm_rhs += y * y
+        diff = abs(x - y)
+        if diff > max_diff:
+            max_diff, max_diff_at = diff, i
+    cosine = dot / (math.sqrt(norm_lhs) * math.sqrt(norm_rhs)) \
+        if norm_lhs and norm_rhs else 0.0
+    top_lhs, top_rhs = topk(lhs, k), topk(rhs, k)
     return {
-        "cosine": cos,
-        "max_abs_diff": maxd,
-        "max_abs_diff_at": argmax_d,
-        "top1_ns": ta[0],
-        "top1_ref": tb[0],
-        "top1_match": ta[0] == tb[0],
-        "topk_overlap": len(set(ta) & set(tb)) / float(k),
+        "cosine": cosine,
+        "max_abs_diff": max_diff,
+        "max_abs_diff_at": max_diff_at,
+        "top1_lhs": top_lhs[0],
+        "top1_rhs": top_rhs[0],
+        "top1_match": top_lhs[0] == top_rhs[0],
+        "topk_overlap": len(set(top_lhs) & set(top_rhs)) / float(k),
     }
 
 
+def empty_summary(label):
+    return {
+        "label": label,
+        "positions": 0,
+        "raw_matches": 0,
+        "tri_matches": 0,
+        "cosine_sum": 0.0,
+        "worst_cosine": 1.0,
+        "worst_position": -1,
+        "overlap_sum": 0.0,
+        "control_matches": 0,
+        "control_cosine_sum": 0.0,
+        "control_worst_cosine": 1.0,
+        "misses": [],
+    }
+
+
+def compare_case(label, ns_path, ref_path, control_path, args):
+    readers = []
+    try:
+        ns_reader = LogitReader(ns_path, args.vocab)
+        readers.append(ns_reader)
+        ref_reader = LogitReader(ref_path, args.vocab)
+        readers.append(ref_reader)
+        control_reader = LogitReader(control_path, args.vocab)
+        readers.append(control_reader)
+
+        lengths = (ns_reader.npos, ref_reader.npos, control_reader.npos)
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                "%s: row-count mismatch: ns=%d ref=%d control=%d"
+                % ((label,) + lengths)
+            )
+        if not ns_reader.npos:
+            raise ValueError("%s: empty logit dump" % label)
+
+        summary = empty_summary(label)
+        summary["positions"] = ns_reader.npos
+        for position in range(ns_reader.npos):
+            ns_logits = ns_reader.read()
+            ref_logits = ref_reader.read()
+            control_logits = control_reader.read()
+
+            primary = stats(ns_logits, ref_logits, args.top)
+            control = stats(ref_logits, control_logits, args.top)
+            ns_token = primary["top1_lhs"]
+            ref_token = primary["top1_rhs"]
+            control_token = control["top1_rhs"]
+            triangulated = primary["top1_match"] or ns_token == control_token
+
+            summary["raw_matches"] += primary["top1_match"]
+            summary["tri_matches"] += triangulated
+            summary["cosine_sum"] += primary["cosine"]
+            summary["overlap_sum"] += primary["topk_overlap"]
+            summary["control_matches"] += control["top1_match"]
+            summary["control_cosine_sum"] += control["cosine"]
+            summary["control_worst_cosine"] = min(
+                summary["control_worst_cosine"], control["cosine"]
+            )
+            if primary["cosine"] < summary["worst_cosine"]:
+                summary["worst_cosine"] = primary["cosine"]
+                summary["worst_position"] = position
+
+            if not triangulated:
+                # D8's worked p1 example identifies the ns-side 0.0006 gap as
+                # "ns's losing margin". The optional strict reading remains a
+                # diagnostic, but D9 adopts the literal ns-side quantity.
+                ref_gap = margin(ref_logits, ref_token, ns_token)
+                ns_gap = margin(ns_logits, ns_token, ref_token)
+                guarded_margin = ns_gap if args.guard_side == "ns" \
+                    else max(ref_gap, ns_gap)
+                drift = max(
+                    abs(ref_logits[ns_token] - control_logits[ns_token]),
+                    abs(ref_logits[ref_token] - control_logits[ref_token]),
+                )
+                summary["misses"].append({
+                    "position": position,
+                    "ns_token": ns_token,
+                    "ref_token": ref_token,
+                    "control_token": control_token,
+                    "guarded_margin": guarded_margin,
+                    "ref_gap": ref_gap,
+                    "ns_gap": ns_gap,
+                    "drift": drift,
+                    "admissible": (
+                        guarded_margin < MAX_ADMISSIBLE_MARGIN
+                        and guarded_margin < drift
+                    ),
+                })
+
+            if args.verbose or not primary["top1_match"]:
+                print(
+                    "%s pos %3d  top1 ns=%-7d ref=%-7d ctl=%-7d %s  "
+                    "cos=%.8f  maxdiff=%.4g @%d  top%d overlap=%.2f"
+                    % (
+                        label,
+                        position,
+                        ns_token,
+                        ref_token,
+                        control_token,
+                        "OK " if triangulated else "MISS",
+                        primary["cosine"],
+                        primary["max_abs_diff"],
+                        primary["max_abs_diff_at"],
+                        args.top,
+                        primary["topk_overlap"],
+                    )
+                )
+        return summary
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+def merge_summaries(summaries):
+    total = empty_summary("TOTAL")
+    offset = 0
+    for summary in summaries:
+        for key in (
+            "positions",
+            "raw_matches",
+            "tri_matches",
+            "cosine_sum",
+            "overlap_sum",
+            "control_matches",
+            "control_cosine_sum",
+        ):
+            total[key] += summary[key]
+        total["control_worst_cosine"] = min(
+            total["control_worst_cosine"], summary["control_worst_cosine"]
+        )
+        if summary["worst_cosine"] < total["worst_cosine"]:
+            total["worst_cosine"] = summary["worst_cosine"]
+            total["worst_position"] = offset + summary["worst_position"]
+        for miss in summary["misses"]:
+            total["misses"].append({"case": summary["label"], **miss})
+        offset += summary["positions"]
+    return total
+
+
+def rate(numerator, denominator):
+    return numerator / float(denominator) if denominator else 0.0
+
+
+def print_case_table(summaries):
+    print("\n=== per-case parity ===")
+    print("  %-12s %5s %12s %12s %13s %13s" % (
+        "case", "pos", "raw top-1", "tri top-1", "ns worst cos", "ctl worst cos"
+    ))
+    for summary in summaries:
+        npos = summary["positions"]
+        print("  %-12s %5d %5d/%-6d %5d/%-6d %13.8f %13.8f" % (
+            summary["label"],
+            npos,
+            summary["raw_matches"],
+            npos,
+            summary["tri_matches"],
+            npos,
+            summary["worst_cosine"],
+            summary["control_worst_cosine"],
+        ))
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("ns")
-    ap.add_argument("oracle")
-    ap.add_argument("--vocab", type=int, required=True)
-    ap.add_argument("--top", type=int, default=5)
-    ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--control", metavar="FILE",
-                    help="a SECOND independent run of the reference engine (e.g. the "
-                         "same model on a different backend). When given, the cosine "
-                         "gate becomes 'ns must match the reference at least as well "
-                         "as the reference matches itself' — a self-calibrating bar "
-                         "that cannot be gamed by loosening a constant.")
-    # gate thresholds from PLAN §8 Stage 1
-    ap.add_argument("--min-top1", type=float, default=0.995)
-    ap.add_argument("--min-cosine", type=float, default=0.9995)
-    ap.add_argument("--guard-side", choices=("ns", "both"), default="both",
-                    help="D8 margin guard: 'ns' reads only ns's own conviction (D8's "
-                         "literal wording); 'both' (default) takes the worse of ns's "
-                         "and the reference's — strict, and the reading that keeps a "
-                         "confidently-wrong engine from passing")
-    ap.add_argument("--max-margin", type=float, default=0.25,
-                    help="D8 margin guard: a residual miss may lose by at most this "
-                         "many logits (default 0.25)")
-    ap.add_argument("--label", default="G1",
-                    help="name for the report line (use CONTROL when diffing two "
-                         "reference runs against each other)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("ns")
+    parser.add_argument("oracle")
+    parser.add_argument("--control", required=True, metavar="FILE",
+                        help="second reference configuration required by D6/D8")
+    parser.add_argument("--case-label", default="primary",
+                        help="label for the positional input triple")
+    parser.add_argument(
+        "--case",
+        action="append",
+        nargs=4,
+        default=[],
+        metavar=("LABEL", "NS", "ORACLE", "CONTROL"),
+        help="append another labelled input triple; may be repeated",
+    )
+    parser.add_argument("--vocab", type=int, required=True)
+    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--min-top1", type=float, default=0.995)
+    parser.add_argument("--min-cosine", type=float, default=0.9995)
+    parser.add_argument(
+        "--guard-side",
+        choices=("ns", "both"),
+        default="ns",
+        help="D8/D9 gate uses 'ns'; 'both' reports the stricter diagnostic reading",
+    )
+    parser.add_argument("--label", default="G1 logits")
+    args = parser.parse_args()
 
-    A = read_logits(args.ns, args.vocab)
-    B = read_logits(args.oracle, args.vocab)
-    C = read_logits(args.control, args.vocab) if args.control else None
-    MARGIN_MAX = args.max_margin
-    npos = min(len(A), len(B))
-    if len(A) != len(B):
-        print(f"warning: {len(A)} positions in ns vs {len(B)} in oracle; comparing {npos}")
+    cases = [(args.case_label, args.ns, args.oracle, args.control)]
+    cases.extend(tuple(case) for case in args.case)
+    try:
+        summaries = [compare_case(*case, args) for case in cases]
+    except (OSError, ValueError) as error:
+        print("compare.py: %s" % error, file=sys.stderr)
+        return 2
 
-    matches = 0          # raw: ns argmax == primary reference argmax
-    tri_matches = 0       # triangulated (D8): ns agrees with either reference path
-    worst_cos = 1.0
-    worst_pos = -1
-    rows = []
-    misses = []           # positions failing triangulation, with their margins
-    for p in range(npos):
-        s = stats(A[p], B[p], args.top)
-        matches += s["top1_match"]
+    total = merge_summaries(summaries)
+    npos = total["positions"]
+    raw_rate = rate(total["raw_matches"], npos)
+    triangulated_rate = rate(total["tri_matches"], npos)
+    mean_cosine = rate(total["cosine_sum"], npos)
+    mean_overlap = rate(total["overlap_sum"], npos)
+    control_rate = rate(total["control_matches"], npos)
+    control_mean_cosine = rate(total["control_cosine_sum"], npos)
+    cosine_bar = min(args.min_cosine, total["control_worst_cosine"])
 
-        # --- D8 triangulation -------------------------------------------------
-        ns_tok, ref_tok = s["top1_ns"], s["top1_ref"]
-        ctl_tok = topk(C[p], 1)[0] if C is not None and p < len(C) else None
-        agrees_ctl = ctl_tok is not None and ns_tok == ctl_tok
-        s["top1_ctl"] = ctl_tok
-        s["triangulated"] = s["top1_match"] or agrees_ctl
-        tri_matches += s["triangulated"]
+    print_case_table(summaries)
+    print("\n=== aggregate parity report (%d positions) ===" % npos)
+    print("  top-1 raw          %.4f  (%d/%d vs primary reference)" % (
+        raw_rate, total["raw_matches"], npos
+    ))
+    print("  top-1 triangulated %.4f  (%d/%d, miss = disagrees with both refs)" % (
+        triangulated_rate, total["tri_matches"], npos
+    ))
+    print("  cosine mean        %.8f" % mean_cosine)
+    print("  cosine worst       %.8f at aggregate pos %d" % (
+        total["worst_cosine"], total["worst_position"]
+    ))
+    print("  top-%d overlap       %.4f" % (args.top, mean_overlap))
+    print("  greedy continuation NOT TESTED (these are teacher-forced logit rows)")
 
-        if not s["triangulated"]:
-            # margin guard: how close was the call, and how much does the
-            # reference itself move between its two configurations?
-            # D8: "ns's losing margin on the contested token pair" — a near-tie
-            # means NEITHER engine held a strong opinion. Measured on both sides:
-            #   ref_gap : how far ahead the reference held its choice over ns's
-            #   ns_gap  : how far ahead ns held its own choice over the reference's
-            # A coin-flip has both ~0. The pre-D7 defect had ns_gap ~14 while
-            # ref_gap stayed small — checking only the reference's side would have
-            # waved it through, which the synthetic guard test caught.
-            ref_gap = margin(B[p], ref_tok, ns_tok)
-            ns_gap  = margin(A[p], ns_tok, ref_tok)
-            # D8's text says "ns's losing margin", which reads as ns_gap alone.
-            # Taken literally that lets a confidently-wrong ns pass whenever the
-            # reference is also near a boundary, so the strict reading takes the
-            # worse of the two convictions. The two disagree only when the engines
-            # disagree about how close the call is — exactly p1 pos 9. Both are
-            # reported; --guard-side selects which one gates.
-            ns_margin = ns_gap if args.guard_side == "ns" else max(ref_gap, ns_gap)
-            drift = 0.0
-            if C is not None and p < len(C):
-                for t in (ns_tok, ref_tok):
-                    drift = max(drift, abs(B[p][t] - C[p][t]))
-            misses.append({"pos": p, "ns": ns_tok, "ref": ref_tok, "ctl": ctl_tok,
-                           "margin": ns_margin, "drift": drift,
-                           "ref_gap": ref_gap, "ns_gap": ns_gap,
-                           "ok": ns_margin < MARGIN_MAX and (C is None or ns_margin < max(drift, 1e-9))})
-        if s["cosine"] < worst_cos:
-            worst_cos, worst_pos = s["cosine"], p
-        rows.append(s)
-        if args.verbose or not s["top1_match"]:
-            print("pos %3d  top1 ns=%-7d ref=%-7d %s  cos=%.8f  maxdiff=%.4g @%d  top%d overlap=%.2f"
-                  % (p, s["top1_ns"], s["top1_ref"], "OK " if s["top1_match"] else "MISS",
-                     s["cosine"], s["max_abs_diff"], s["max_abs_diff_at"], args.top,
-                     s["topk_overlap"]))
+    print("\n=== control: reference engine vs itself ===")
+    print("  top-1 agreement     %.4f" % control_rate)
+    print("  cosine mean         %.8f" % control_mean_cosine)
+    print("  cosine worst        %.8f" % total["control_worst_cosine"])
+    print("  cosine gate = min(configured %.6f, control %.8f) = %.8f" % (
+        args.min_cosine, total["control_worst_cosine"], cosine_bar
+    ))
 
-    # Control: how well does the reference engine agree with *itself* across two
-    # independent runs? No implementation can be expected to beat that.
-    ctl_worst, ctl_mean, ctl_top1 = None, None, None
-    if C is not None:
-        cw, csum, cm = 1.0, 0.0, 0
-        for p in range(min(npos, len(C))):
-            cs = stats(B[p], C[p], args.top)
-            cw = min(cw, cs["cosine"])
-            csum += cs["cosine"]
-            cm += cs["top1_match"]
-        ctl_worst, ctl_mean = cw, csum / float(min(npos, len(C)))
-        ctl_top1 = cm / float(min(npos, len(C)))
-
-    top1_rate = matches / float(npos) if npos else 0.0
-    tri_rate = tri_matches / float(npos) if npos else 0.0
-    mean_cos = sum(r["cosine"] for r in rows) / float(npos) if npos else 0.0
-    mean_overlap = sum(r["topk_overlap"] for r in rows) / float(npos) if npos else 0.0
-    greedy_ns = [r["top1_ns"] for r in rows]
-    greedy_ref = [r["top1_ref"] for r in rows]
-
-    # D8: the greedy criterion triangulates the same way — a continuation counts as
-    # identical if every position matches one of the reference paths.
-    greedy_ok = all(r["triangulated"] for r in rows) if C is not None \
-        else greedy_ns == greedy_ref
-
-    print("\n=== parity report (%d positions) ===" % npos)
-    print("  top-1 raw         %.4f  (%d/%d vs the primary reference)"
-          % (top1_rate, matches, npos))
-    if C is not None:
-        print("  top-1 triangulated %.4f  (%d/%d, D8: miss = disagrees with BOTH refs)"
-              % (tri_rate, tri_matches, npos))
-    else:
-        print("  top-1 triangulated  n/a   (pass --control to enable D8 triangulation)")
-    print("  cosine  mean      %.8f" % mean_cos)
-    print("  cosine  worst     %.8f at pos %d  (gate >= %.6f)"
-          % (worst_cos, worst_pos, args.min_cosine))
-    print("  top-%d overlap     %.4f" % (args.top, mean_overlap))
-    print("  greedy identical  %s%s" % (greedy_ns == greedy_ref,
-          "" if C is None else "   (triangulated: %s)" % greedy_ok))
-
-    cos_bar = args.min_cosine
-    if ctl_worst is not None:
-        print("\n=== control: reference engine vs itself (%d positions) ===" % npos)
-        print("  top-1 agreement   %.4f" % ctl_top1)
-        print("  cosine  mean      %.8f" % ctl_mean)
-        print("  cosine  worst     %.8f" % ctl_worst)
-        cos_bar = min(args.min_cosine, ctl_worst)
-        print("\n  cosine gate = min(configured %.6f, control %.8f) = %.8f"
-              % (args.min_cosine, ctl_worst, cos_bar))
-        print("  (an implementation cannot be held to a tighter bar than the")
-        print("   reference engine's own run-to-run reproducibility)")
-
-    # --- D8 margin guard ------------------------------------------------------
     guard_ok = True
-    if misses:
-        print("\n=== residual misses (D8 margin guard) ===")
-        print("  every miss must be a near-tie: margin < %.2f logits and below the"
-              % MARGIN_MAX)
-        print("  reference's own cross-config drift on the contested pair\n")
-        for m in misses:
-            print("  pos %3d  ns=%-7d ref=%-7d ctl=%-7s  worst conviction %.4f "
-                  "(ref held by %.4f, ns held by %.4f)  ref drift %.4f  %s"
-                  % (m["pos"], m["ns"], m["ref"],
-                     "n/a" if m["ctl"] is None else str(m["ctl"]),
-                     m["margin"], m["ref_gap"], m["ns_gap"], m["drift"],
-                     "OK" if m["ok"] else "*** NOT A NEAR-TIE ***"))
-            if not m["ok"]:
-                guard_ok = False
-        if not guard_ok:
-            print("\n  a miss failed the margin guard — that is a real disagreement,")
-            print("  not oracle noise. Bisect it (PLAN §10) before touching the gate.")
+    if total["misses"]:
+        print("\n=== residual misses (D8/D9 margin guard: %s side) ===" % args.guard_side)
+        print("  guarded margin must be < %.2f logits and < reference drift" %
+              MAX_ADMISSIBLE_MARGIN)
+        for miss in total["misses"]:
+            status = "OK" if miss["admissible"] else "*** NOT ADMISSIBLE ***"
+            print(
+                "  %-12s pos %3d  ns=%-7d ref=%-7d ctl=%-7d  guarded %.4f "
+                "(ref %.4f, ns %.4f)  drift %.4f  %s"
+                % (
+                    miss["case"],
+                    miss["position"],
+                    miss["ns_token"],
+                    miss["ref_token"],
+                    miss["control_token"],
+                    miss["guarded_margin"],
+                    miss["ref_gap"],
+                    miss["ns_gap"],
+                    miss["drift"],
+                    status,
+                )
+            )
+            guard_ok &= miss["admissible"]
 
-    # The gate scores triangulated agreement when a control is supplied (D8);
-    # without one there is nothing to triangulate against and raw is all we have.
-    scored_top1 = tri_rate if C is not None else top1_rate
-    ok = (scored_top1 >= args.min_top1 and worst_cos >= cos_bar
-          and greedy_ok and guard_ok)
+    sample_ok = npos >= MIN_GATE_POSITIONS
+    if not sample_ok:
+        print("\n  sample-size gate: %d < required %d positions" % (
+            npos, MIN_GATE_POSITIONS
+        ))
+    ok = (
+        sample_ok
+        and triangulated_rate >= args.min_top1
+        and total["worst_cosine"] >= cosine_bar
+        and guard_ok
+    )
     print("\n%s: %s" % (args.label, "GREEN" if ok else "RED"))
-    if not ok:
-        print("  divergence hunt: dump per-layer activations on both sides and bisect —")
-        print("  the first layer whose cosine drops is where the bug lives (PLAN §8/§10).")
+    if not ok and not guard_ok:
+        print("  a residual miss is outside the oracle-noise guard; bisect it (PLAN §10)")
     return 0 if ok else 1
 
 

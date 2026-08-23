@@ -12,6 +12,8 @@
 //
 //   make tools
 //   ./build/release/tools/oracle_logits -m model.gguf -t 760,6511,314 -o ref.bin
+//   ./build/release/tools/oracle_logits -m model.gguf -t 760,6511,314 \
+//       --generate 64 --dump-tokens continuation.bin
 // ============================================================================
 #include "ggml-backend.h"
 #include "llama.h"
@@ -21,6 +23,16 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+static_assert(sizeof(llama_token) == sizeof(int32_t), "raw token dump requires int32 IDs");
+
+static void oracle_log(ggml_log_level level, const char* text, void*) {
+    // Model loading emits thousands of INFO lines for this 866-tensor file.
+    // Keep warnings/errors visible so parity commands remain auditable.
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fputs(text, stderr);
+    }
+}
 
 static std::vector<llama_token> parse_tokens(const std::string& csv) {
     std::vector<llama_token> out;
@@ -36,7 +48,8 @@ static std::vector<llama_token> parse_tokens(const std::string& csv) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_path, tokens_csv, out_path;
+    std::string model_path, tokens_csv, out_path, token_path;
+    int generate = 0;
     int n_gpu_layers = 0;   // CPU backend is the oracle (PLAN §9.1)
     bool cpu_only = true;   // and it must be *purely* CPU: see below
     bool kv_f32   = true;   // match cpu_ref's fp32 KV cache: see below
@@ -50,9 +63,13 @@ int main(int argc, char** argv) {
         else if (a == "--allow-gpu-backend") cpu_only = false;
         else if (a == "--kv-f16") kv_f32 = false;
         else if (a == "--batched") stepwise = false;
+        else if (a == "--generate" && i + 1 < argc) generate = atoi(argv[++i]);
+        else if (a == "--dump-tokens" && i + 1 < argc) token_path = argv[++i];
         else {
             fprintf(stderr,
-                    "usage: oracle_logits -m model.gguf -t 1,2,3 -o out.bin\n"
+                    "usage: oracle_logits -m model.gguf -t 1,2,3 [-o out.bin]\n"
+                    "  --generate N         feed back N greedy argmax tokens\n"
+                    "  --dump-tokens FILE   write generated IDs as raw int32\n"
                     "  --kv-f16             use llama.cpp's default f16 KV cache\n"
                     "  --batched            prefill all tokens in one llama_decode\n"
                     "  --gpu-layers N       offload N layers (NOT the normative oracle)\n"
@@ -60,13 +77,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (model_path.empty() || tokens_csv.empty() || out_path.empty()) {
-        fprintf(stderr, "oracle_logits: -m, -t and -o are all required\n");
+    if (model_path.empty() || tokens_csv.empty() ||
+        (out_path.empty() && token_path.empty()) || generate < 0 ||
+        (!token_path.empty() && generate == 0)) {
+        fprintf(stderr, "oracle_logits: -m and -t plus an output are required\n");
         return 2;
     }
     const std::vector<llama_token> tokens = parse_tokens(tokens_csv);
     if (tokens.empty()) { fprintf(stderr, "oracle_logits: no tokens\n"); return 2; }
 
+    llama_log_set(oracle_log, nullptr);
     llama_backend_init();
 
     llama_model_params mp = llama_model_default_params();
@@ -93,7 +113,7 @@ int main(int argc, char** argv) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx   = (uint32_t)tokens.size() + 8;
+    cp.n_ctx   = (uint32_t)tokens.size() + (uint32_t)generate + 8;
     cp.n_batch = (uint32_t)tokens.size() + 8;
     cp.n_ubatch = (uint32_t)tokens.size() + 8;
 
@@ -111,20 +131,30 @@ int main(int argc, char** argv) {
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "oracle_logits: failed to create context\n"); return 1; }
 
-    FILE* f = fopen(out_path.c_str(), "wb");
-    if (!f) { fprintf(stderr, "oracle_logits: cannot write %s\n", out_path.c_str()); return 1; }
+    FILE* f = nullptr;
+    if (!out_path.empty()) {
+        f = fopen(out_path.c_str(), "wb");
+        if (!f) { fprintf(stderr, "oracle_logits: cannot write %s\n", out_path.c_str()); return 1; }
+    }
 
-    auto emit = [&](size_t i, int32_t which) {
+    auto logits_at = [&](int32_t which) {
         const float* lg = llama_get_logits_ith(ctx, which);
-        if (!lg) { fprintf(stderr, "oracle_logits: no logits at %zu\n", i); exit(1); }
-        if (fwrite(lg, sizeof(float), (size_t)n_vocab, f) != (size_t)n_vocab) {
+        if (!lg) { fprintf(stderr, "oracle_logits: no logits row %d\n", which); exit(1); }
+        return lg;
+    };
+
+    auto emit = [&](size_t i, llama_token input, int32_t which) {
+        const float* lg = logits_at(which);
+        if (f && fwrite(lg, sizeof(float), (size_t)n_vocab, f) != (size_t)n_vocab) {
             fprintf(stderr, "oracle_logits: short write\n");
             exit(1);
         }
         int best = 0;
         for (int v = 1; v < n_vocab; v++) if (lg[v] > lg[best]) best = v;
-        printf("  pos %3zu token %6d -> argmax %6d  logit %.4f\n", i, tokens[i], best, lg[best]);
+        printf("  pos %3zu token %6d -> argmax %6d  logit %.4f\n", i, input, best, lg[best]);
     };
+
+    int32_t final_logits_row = 0;
 
     if (stepwise) {
         // One token per llama_decode — the *decode* path, which is what ns's CPU
@@ -145,8 +175,9 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "oracle_logits: llama_decode failed at %zu\n", i);
                 return 1;
             }
-            emit(i, 0);
+            emit(i, tokens[i], 0);
         }
+        final_logits_row = 0;
         llama_batch_free(batch);
     } else {
         printf("oracle: batched prefill (all tokens in one llama_decode)\n");
@@ -163,11 +194,55 @@ int main(int argc, char** argv) {
             fprintf(stderr, "oracle_logits: llama_decode failed\n");
             return 1;
         }
-        for (size_t i = 0; i < tokens.size(); i++) emit(i, (int32_t)i);
+        for (size_t i = 0; i < tokens.size(); i++) emit(i, tokens[i], (int32_t)i);
+        final_logits_row = (int32_t)tokens.size() - 1;
         llama_batch_free(batch);
     }
-    fclose(f);
-    printf("wrote %zu x %d fp32 logits to %s\n", tokens.size(), n_vocab, out_path.c_str());
+
+    std::vector<llama_token> generated;
+    generated.reserve((size_t)generate);
+    llama_batch decode_batch = llama_batch_init(1, 0, 1);
+    for (int i = 0; i < generate; i++) {
+        const float* lg = logits_at(final_logits_row);
+        llama_token next = 0;
+        for (int v = 1; v < n_vocab; v++) if (lg[v] > lg[next]) next = (llama_token)v;
+        generated.push_back(next);
+        printf("  gen %3d -> token %6d  logit %.4f\n", i, next, lg[next]);
+        if (i + 1 < generate) {
+            decode_batch.n_tokens = 1;
+            decode_batch.token[0] = next;
+            decode_batch.pos[0] = (llama_pos)tokens.size() + i;
+            decode_batch.n_seq_id[0] = 1;
+            decode_batch.seq_id[0][0] = 0;
+            decode_batch.logits[0] = 1;
+            if (llama_decode(ctx, decode_batch) != 0) {
+                fprintf(stderr, "oracle_logits: generation decode failed at %d\n", i);
+                return 1;
+            }
+            final_logits_row = 0;
+        }
+    }
+    llama_batch_free(decode_batch);
+
+    if (!token_path.empty()) {
+        FILE* token_file = fopen(token_path.c_str(), "wb");
+        if (!token_file) {
+            fprintf(stderr, "oracle_logits: cannot write %s\n", token_path.c_str());
+            return 1;
+        }
+        if (fwrite(generated.data(), sizeof(llama_token), generated.size(), token_file) !=
+            generated.size()) {
+            fprintf(stderr, "oracle_logits: short token write\n");
+            return 1;
+        }
+        fclose(token_file);
+        printf("generated tokens written to %s (%zu raw int32 IDs)\n",
+               token_path.c_str(), generated.size());
+    }
+    if (f) {
+        fclose(f);
+        printf("wrote %zu x %d fp32 logits to %s\n", tokens.size(), n_vocab, out_path.c_str());
+    }
 
     llama_free(ctx);
     llama_model_free(model);

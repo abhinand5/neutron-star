@@ -33,14 +33,17 @@ static int usage() {
             "  --tensors   dump every tensor (name, shape, type, offset)\n"
             "\n"
             "       ns eval <model.gguf> --tokens a,b,c [--topk N] [--all-pos]\n"
-            "                            [--dump-logits FILE]\n"
+            "                            [--dump-logits FILE] [--generate N]\n"
+            "                            [--dump-tokens FILE] [--ggml-act-quant]\n"
             "  runs the CPU reference forward pass (PLAN §4.3) over a token\n"
-            "  sequence and prints the top-k predictions. Slow by design.\n");
+            "  sequence and prints the top-k predictions. --generate feeds greedy\n"
+            "  argmax tokens back into the model and writes raw int32 token IDs.\n");
     return 2;
 }
 
 static int cmd_eval(const std::string& path, const std::string& tokens_csv, int topk,
-                    bool all_pos, const std::string& dump_path, int debug_pos = -1,
+                    bool all_pos, const std::string& dump_path, int generate,
+                    const std::string& token_path, int debug_pos = -1,
                     const std::string& act_path = "") {
     std::vector<int32_t> tokens;
     {
@@ -97,6 +100,28 @@ static int cmd_eval(const std::string& path, const std::string& tokens_csv, int 
             printf(" [%d]=%.4f(p=%.3f)", idx[j], logits[idx[j]],
                    exp((double)(logits[idx[j]] - mx)) / sum);
         printf("\n");
+    }
+
+    std::vector<int32_t> generated;
+    generated.reserve((size_t)generate);
+    for (int i = 0; i < generate; i++) {
+        const int32_t next = (int32_t)std::distance(
+            logits.begin(), std::max_element(logits.begin(), logits.end()));
+        generated.push_back(next);
+        printf("  gen %3d -> token %6d  logit %.4f\n", i, next, logits[(size_t)next]);
+        if (i + 1 < generate) {
+            ref_forward(m, st, next, (int32_t)tokens.size() + i, logits);
+        }
+    }
+    if (!token_path.empty()) {
+        FILE* token_dump = fopen(token_path.c_str(), "wb");
+        NS_CHECK(token_dump, "cannot write %s", token_path.c_str());
+        NS_CHECK(fwrite(generated.data(), sizeof(int32_t), generated.size(), token_dump) ==
+                     generated.size(),
+                 "short write to %s", token_path.c_str());
+        fclose(token_dump);
+        printf("generated tokens written to %s (%zu raw int32 IDs)\n",
+               token_path.c_str(), generated.size());
     }
     ref_close_activations();
     if (!act_path.empty()) printf("activations written to %s\n", act_path.c_str());
@@ -208,8 +233,8 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     if (cmd == "eval") {
         if (argc < 3) return usage();
-        std::string tokens, dump, act;
-        int topk = 5, debug_pos = -1;
+        std::string tokens, dump, act, token_dump;
+        int topk = 5, debug_pos = -1, generate = 0;
         bool all_pos = false, act_quant = false;
         for (int i = 3; i < argc; i++) {
             const std::string a = argv[i];
@@ -220,10 +245,14 @@ int main(int argc, char** argv) {
             else if (a == "--debug-pos" && i + 1 < argc) debug_pos = atoi(argv[++i]);
             else if (a == "--dump-activations" && i + 1 < argc) act = argv[++i];
             else if (a == "--ggml-act-quant") act_quant = true;
+            else if (a == "--generate" && i + 1 < argc) generate = atoi(argv[++i]);
+            else if (a == "--dump-tokens" && i + 1 < argc) token_dump = argv[++i];
             else return usage();
         }
+        if (generate < 0 || (!token_dump.empty() && generate == 0)) return usage();
         if (act_quant) ref_set_act_quant(true);
-        return cmd_eval(argv[2], tokens, topk, all_pos, dump, debug_pos, act);
+        return cmd_eval(argv[2], tokens, topk, all_pos, dump, generate, token_dump,
+                        debug_pos, act);
     }
     if (cmd == "inspect") {
         if (argc < 3) return usage();

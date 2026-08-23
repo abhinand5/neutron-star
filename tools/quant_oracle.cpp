@@ -34,6 +34,20 @@ void dequantize_row_q8_0(const void* x, float* y, int64_t k);
 void dequantize_row_iq3_s(const void* x, float* y, int64_t k);
 void dequantize_row_iq4_nl(const void* x, float* y, int64_t k);
 void dequantize_row_iq4_xs(const void* x, float* y, int64_t k);
+void quantize_row_q8_K_ref(const float* x, void* y, int64_t k);
+void ggml_vec_dot_q3_K_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                    size_t bx, const void* vy, size_t by, int nrc);
+void ggml_vec_dot_q4_K_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                    size_t bx, const void* vy, size_t by, int nrc);
+void ggml_vec_dot_q5_K_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                    size_t bx, const void* vy, size_t by, int nrc);
+void ggml_vec_dot_q6_K_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                    size_t bx, const void* vy, size_t by, int nrc);
+void ggml_vec_dot_iq3_s_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                     size_t bx, const void* vy, size_t by, int nrc);
+void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float* s, size_t bs, const void* vx,
+                                      size_t bx, const void* vy, size_t by, int nrc);
+void ggml_cpu_init(void);
 }
 
 using namespace ns;
@@ -49,6 +63,21 @@ static bool ggml_dequant(int32_t type, const void* src, float* dst, int64_t k) {
         case NS_IQ4_NL: dequantize_row_iq4_nl(src, dst, k); return true;
         case NS_IQ4_XS: dequantize_row_iq4_xs(src, dst, k); return true;
         default: return false;   // F32/F16/BF16 are not ggml "quant rows"
+    }
+}
+
+using GgmlDot = void (*)(int, float*, size_t, const void*, size_t,
+                         const void*, size_t, int);
+
+static GgmlDot ggml_q8_K_dot(int32_t type) {
+    switch (type) {
+        case NS_Q3_K:   return ggml_vec_dot_q3_K_q8_K_generic;
+        case NS_Q4_K:   return ggml_vec_dot_q4_K_q8_K_generic;
+        case NS_Q5_K:   return ggml_vec_dot_q5_K_q8_K_generic;
+        case NS_Q6_K:   return ggml_vec_dot_q6_K_q8_K_generic;
+        case NS_IQ3_S:  return ggml_vec_dot_iq3_s_q8_K_generic;
+        case NS_IQ4_XS: return ggml_vec_dot_iq4_xs_q8_K_generic;
+        default: return nullptr;
     }
 }
 
@@ -178,6 +207,104 @@ static int check_model(const std::string& path) {
     return failures;
 }
 
+// Exact per-row verification of Stage 2 task 0. Every supported matrix in the
+// model contributes its first/middle/last row. Intermediate Q8_K bytes must
+// match pinned ggml bit-for-bit; final dots allow only host reduction drift.
+static int check_q8_K_dots(const std::string& path) {
+    GgufFile file;
+    std::string error;
+    if (!file.open(path, &error)) {
+        printf("--- Q8_K dots %s: SKIP (%s) ---\n", path.c_str(), error.c_str());
+        return 0;
+    }
+    printf("--- Q8_K integer row dots %s ---\n", path.c_str());
+    int failures = 0;
+    int bit_differences = 0;
+    int tensors = 0;
+    int rows = 0;
+    size_t elements = 0;
+    size_t per_type[NS_TYPE_COUNT] = {0};
+    float max_abs_error = 0.0f;
+    float max_rel_error = 0.0f;
+    std::string max_error_row;
+    for (const GgufTensor& tensor : file.tensors()) {
+        GgmlDot reference_dot = ggml_q8_K_dot(tensor.type);
+        if (!reference_dot || tensor.n_dims != 2) continue;
+        const TypeInfo& info = type_info(tensor.type);
+        const int64_t k = tensor.ne[0];
+        const int64_t nrows = tensor.ne[1];
+        if (k % QK_K != 0 || nrows <= 0) continue;
+
+        std::vector<float> activation((size_t)k);
+        for (int64_t i = 0; i < k; i++) {
+            activation[(size_t)i] =
+                0.7f * sinf(0.013f * (float)(i + 1)) +
+                0.3f * cosf(0.019f * (float)(i + 7));
+        }
+        std::vector<block_q8_K> ns_q8((size_t)(k / QK_K));
+        std::vector<block_q8_K> ref_q8((size_t)(k / QK_K));
+        quantize_row_q8_K(activation.data(), ns_q8.data(), k);
+        quantize_row_q8_K_ref(activation.data(), ref_q8.data(), k);
+        if (memcmp(ns_q8.data(), ref_q8.data(), ns_q8.size() * sizeof(block_q8_K)) != 0) {
+            if (failures++ < 5)
+                printf("  Q8_K MISMATCH for %s activation (%" PRId64 " elements)\n",
+                       tensor.name.c_str(), k);
+            continue;
+        }
+
+        const size_t row_bytes = (size_t)(k / info.blck) * (size_t)info.bytes;
+        const int64_t candidates[3] = {0, nrows / 2, nrows - 1};
+        for (int sample = 0; sample < 3; sample++) {
+            if (sample > 0 && candidates[sample] == candidates[sample - 1]) continue;
+            const uint8_t* weight_row = tensor.data + (size_t)candidates[sample] * row_bytes;
+            float ns_result = 0.0f;
+            float ref_result = 0.0f;
+            if (!vec_dot_q8_K(tensor.type, weight_row, ns_q8.data(), k, &ns_result)) {
+                if (failures++ < 5)
+                    printf("  ns refused Q8_K dot for %s\n", tensor.name.c_str());
+                continue;
+            }
+            reference_dot((int)k, &ref_result, 0, weight_row, 0, ref_q8.data(), 0, 1);
+            if (!bit_equal(ns_result, ref_result)) bit_differences++;
+            const float abs_error = fabsf(ns_result - ref_result);
+            const float rel_error = abs_error / fmaxf(1e-6f, fabsf(ref_result));
+            if (abs_error > max_abs_error) {
+                max_abs_error = abs_error;
+                char row_name[256];
+                snprintf(row_name, sizeof(row_name), "%s row %" PRId64,
+                         tensor.name.c_str(), candidates[sample]);
+                max_error_row = row_name;
+            }
+            max_rel_error = fmaxf(max_rel_error, rel_error);
+            // The pinned generic function is auto-vectorized by the x86 build,
+            // so its final fp32 lane reduction is not bit-identical to the
+            // literal scalar source copied into ns. Integer products are exact;
+            // allow only a tight absolute tolerance for final association drift.
+            const float tolerance = 1e-5f * fmaxf(1.0f, fabsf(ref_result));
+            if (abs_error > tolerance) {
+                if (failures++ < 5) {
+                    printf("  DOT MISMATCH %s row %" PRId64 ": ns=%.9g ggml=%.9g "
+                           "abs=%.9g tolerance=%.9g\n", tensor.name.c_str(),
+                           candidates[sample], ns_result, ref_result, abs_error, tolerance);
+                }
+            }
+            rows++;
+            elements += (size_t)k;
+        }
+        per_type[tensor.type]++;
+        tensors++;
+    }
+    printf("  %d tensors, %d rows, %zu elements: %s\n", tensors, rows, elements,
+           failures ? "MISMATCH" : "matched ggml generic vec_dot");
+    printf("  %d bit-different fp32 reductions; max abs %.9g at %s; max rel %.9g\n",
+           bit_differences, max_abs_error, max_error_row.c_str(), max_rel_error);
+    printf("  coverage:");
+    for (int type = 0; type < NS_TYPE_COUNT; type++)
+        if (per_type[type]) printf(" %s:%zu", type_info(type).name, per_type[type]);
+    printf("\n");
+    return failures;
+}
+
 // ---------------------------------------------------------------------------
 // Emit a self-contained fixture: real blocks from a real model, plus the float
 // bit patterns ggml produces for them.
@@ -297,6 +424,9 @@ static int check_tensor_full(const std::string& path, const std::string& tname) 
 }
 
 int main(int argc, char** argv) {
+    // The generic CPU dots convert fp16 scales through ggml-cpu's lookup table.
+    // Direct callers (unlike llama_backend_init) must initialize that table.
+    ggml_cpu_init();
     const char* home = getenv("HOME");
     const std::string dir = std::string(home ? home : "") + "/dev/models/Qwen3.8-27B/";
     bool do_golden = false;
@@ -320,10 +450,13 @@ int main(int argc, char** argv) {
     failures += fuzz(iters);
     failures += check_model(dir + "Qwen3.8-27B-UD-Q4_K_XL.gguf");
     failures += check_model(dir + "Qwen3.8-27B-UD-Q5_K_XL.gguf");
+    failures += check_q8_K_dots(dir + "Qwen3.8-27B-UD-Q4_K_XL.gguf");
+    failures += check_q8_K_dots(dir + "Qwen3.8-27B-UD-Q5_K_XL.gguf");
     if (do_golden) failures += emit_golden(dir + "Qwen3.8-27B-UD-Q4_K_XL.gguf",
                                            "tests/golden_quants.h");
 
-    printf("\n%s\n", failures ? "QUANT ORACLE: MISMATCH — ns dequant differs from llama.cpp"
-                              : "QUANT ORACLE: ns dequant is BIT-EXACT vs llama.cpp");
+    printf("\n%s\n", failures
+        ? "QUANT ORACLE: MISMATCH — ns differs from llama.cpp"
+        : "QUANT ORACLE: dequant bit-exact; Q8_K row dots match llama.cpp");
     return failures ? 1 : 0;
 }

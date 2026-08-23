@@ -1,97 +1,137 @@
 #!/usr/bin/env python3
-"""Self-test for the G1 gate logic in tools/compare.py (DECISIONS D6/D8).
+"""Self-test for the D6/D8/D9 logit-gate logic in tools/compare.py."""
 
-The gate decides whether the engine is correct, so the gate itself needs a test.
-Three synthetic cases, each a known verdict:
+import copy
+import os
+import random
+import struct
+import subprocess
+import sys
+import tempfile
 
-  A. ns disagrees with the primary reference but agrees with the control
-     -> D8 triangulation must ACQUIT (the oracle has no answer there).
-  B. ns disagrees with both, by a hair, under the reference's own drift
-     -> the margin guard must ADMIT it as a coin-flip.
-  C. ns disagrees with both by ~14 logits (the pre-D7 defect signature)
-     -> the margin guard must REJECT it, whatever the counts say.
 
-Case C is the one that matters: it is the reason the guard exists. An earlier
-draft of the guard measured conviction only on the reference's logits and waved
-C straight through.
-
-run: python3 tests/test_compare_gate.py
-"""
-import copy, os, random, struct, subprocess, sys, tempfile
-
-V, N = 64, 8
+VOCAB_SIZE = 64
+GATE_POSITIONS = 200
 HERE = os.path.dirname(os.path.abspath(__file__))
 COMPARE = os.path.join(HERE, os.pardir, "tools", "compare.py")
 
 
-def write(path, rows):
-    with open(path, "wb") as f:
-        for r in rows:
-            f.write(struct.pack("<%df" % V, *r))
+def write_logits(path, rows):
+    with open(path, "wb") as output:
+        for row in rows:
+            output.write(struct.pack("<%df" % VOCAB_SIZE, *row))
 
 
-def build(tmp):
+def build_fixtures(tmp):
     random.seed(11)
-    base = [[random.gauss(0, 3) for _ in range(V)] for _ in range(N)]
-    ref = copy.deepcopy(base)
-    ctl = [[x + random.gauss(0, 0.05) for x in r] for r in base]
-    ns = [[x + random.gauss(0, 0.05) for x in r] for r in base]
-    a, b = 5, 9
-    # A: ref picks a, control and ns pick b
-    ref[3][a], ref[3][b] = 10.00, 9.95
-    ctl[3][a], ctl[3][b] = 9.95, 10.00
-    ns[3][a], ns[3][b] = 9.95, 10.00
-    # B: both refs pick a by 0.01 while drifting 0.06 on those tokens; ns picks b
-    ref[5][a], ref[5][b] = 8.00, 7.99
-    ctl[5][a], ctl[5][b] = 8.06, 7.95
-    ns[5][a], ns[5][b] = 7.99, 8.00
-    write(os.path.join(tmp, "ns.bin"), ns)
-    write(os.path.join(tmp, "ref.bin"), ref)
-    write(os.path.join(tmp, "ctl.bin"), ctl)
-    # C: ns is confidently wrong at the same position
-    bad = copy.deepcopy(ns)
-    bad[5][a], bad[5][b] = -6.0, 8.0
-    write(os.path.join(tmp, "ns_bad.bin"), bad)
+    base = [
+        [random.gauss(0, 3) for _ in range(VOCAB_SIZE)]
+        for _ in range(GATE_POSITIONS)
+    ]
+    reference = copy.deepcopy(base)
+    control = copy.deepcopy(base)
+    neutron_star = copy.deepcopy(base)
+    reference_token, ns_token = 5, 9
+
+    # Triangulation: primary picks reference_token; control and ns pick ns_token.
+    reference[3][reference_token], reference[3][ns_token] = 10.00, 9.95
+    control[3][reference_token], control[3][ns_token] = 9.95, 10.00
+    neutron_star[3][reference_token], neutron_star[3][ns_token] = 9.95, 10.00
+
+    # D8's p1 shape: both refs prefer reference_token confidently, while ns is a
+    # 0.0006 near-tie and the reference paths drift by 0.06 on the pair.
+    reference[5][reference_token], reference[5][ns_token] = 10.20, 10.00
+    control[5][reference_token], control[5][ns_token] = 10.14, 10.04
+    neutron_star[5][reference_token], neutron_star[5][ns_token] = 9.9994, 10.00
+
+    confidently_wrong = copy.deepcopy(neutron_star)
+    confidently_wrong[5][reference_token], confidently_wrong[5][ns_token] = -4.0, 10.0
+
+    paths = {}
+    for name, rows in (
+        ("ns", neutron_star),
+        ("ns_bad", confidently_wrong),
+        ("ref", reference),
+        ("control", control),
+    ):
+        paths[name] = os.path.join(tmp, "%s.bin" % name)
+        write_logits(paths[name], rows)
+    return paths
 
 
-def run(tmp, ns_file):
-    p = subprocess.run([sys.executable, COMPARE,
-                        os.path.join(tmp, ns_file), os.path.join(tmp, "ref.bin"),
-                        "--control", os.path.join(tmp, "ctl.bin"),
-                        "--vocab", str(V), "--top", "3"],
-                       capture_output=True, text=True)
-    return p.stdout
+def run_compare(paths, ns_name="ns", *extra_args):
+    command = [
+        sys.executable,
+        COMPARE,
+        paths[ns_name],
+        paths["ref"],
+        "--control",
+        paths["control"],
+        "--vocab",
+        str(VOCAB_SIZE),
+        "--top",
+        "3",
+        "--min-cosine",
+        "0",
+    ]
+    command.extend(extra_args)
+    return subprocess.run(command, capture_output=True, text=True)
 
 
 def main():
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
-        build(tmp)
-
-        good = run(tmp, "ns.bin")
-        bad = run(tmp, "ns_bad.bin")
+        paths = build_fixtures(tmp)
+        adopted = run_compare(paths)
+        strict = run_compare(paths, "ns", "--guard-side", "both")
+        bad = run_compare(paths, "ns_bad")
 
         checks = [
-            ("A: triangulation acquits the control-agreeing position",
-             "top-1 raw         0.7500" in good and "0.8750" in good),
-            ("B: a genuine near-tie passes the margin guard",
-             "NOT A NEAR-TIE" not in good),
-            ("C: a ~14-logit disagreement is rejected by the guard",
-             "NOT A NEAR-TIE" in bad),
-            ("C: and the failure is explained, not silent",
-             "real disagreement" in bad),
-            ("raw top-1 stays visible in both reports",
-             "top-1 raw" in good and "top-1 raw" in bad),
+            (
+                "triangulation + one admissible miss yields a GREEN 199/200 gate",
+                adopted.returncode == 0
+                and "top-1 triangulated 0.9950  (199/200" in adopted.stdout
+                and "G1 logits: GREEN" in adopted.stdout,
+            ),
+            (
+                "D9 defaults to ns's 0.0006 margin",
+                "guarded 0.0006" in adopted.stdout
+                and "NOT ADMISSIBLE" not in adopted.stdout,
+            ),
+            (
+                "the optional both-sides diagnostic rejects the 0.20 ref gap",
+                strict.returncode == 1
+                and "guarded 0.2000" in strict.stdout
+                and "NOT ADMISSIBLE" in strict.stdout,
+            ),
+            (
+                "a confidently-wrong ns is rejected by the adopted guard",
+                bad.returncode == 1
+                and "guarded 14.0000" in bad.stdout
+                and "NOT ADMISSIBLE" in bad.stdout,
+            ),
+            (
+                "raw top-1 remains visible",
+                "top-1 raw" in adopted.stdout and "top-1 raw" in bad.stdout,
+            ),
+            (
+                "teacher-forced rows are not mislabeled as a greedy continuation",
+                "greedy continuation NOT TESTED" in adopted.stdout,
+            ),
         ]
-        for name, ok in checks:
-            print("  %-58s %s" % (name, "PASS" if ok else "FAIL"))
-            if not ok:
+        for name, passed in checks:
+            print("  %-70s %s" % (name, "PASS" if passed else "FAIL"))
+            if not passed:
                 failures += 1
         if failures:
-            print("\n--- good-case output ---\n" + good)
-            print("\n--- bad-case output ---\n" + bad)
-    print("  OK — gate logic behaves as DECISIONS D8 specifies" if not failures
-          else "  %d gate-logic check(s) FAILED" % failures)
+            print("\n--- adopted output ---\n" + adopted.stdout + adopted.stderr)
+            print("\n--- strict output ---\n" + strict.stdout + strict.stderr)
+            print("\n--- bad output ---\n" + bad.stdout + bad.stderr)
+
+    if failures:
+        print("  %d gate-logic check(s) FAILED" % failures)
+    else:
+        print("  OK — the executable verdict matches DECISIONS D8/D9")
     return 1 if failures else 0
 
 
