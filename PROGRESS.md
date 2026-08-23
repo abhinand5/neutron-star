@@ -1031,3 +1031,98 @@ No whitespace errors. `test_gguf`, `test_gpu_gemv`, `test_gpu_upload`,
 **NEXT:** Stage 2 task 3 in PLAN order: implement K2's GDN/delta-rule state
 kernel and a random-state CPU-reference unit test with max-abs < 1e-4. Preserve
 the standalone latency debt above for the fused-kernel perf pass in task 7.
+
+---
+
+## 2026-08-23 — Session 9 (Stage 2 task 3: fused GDN K2, GPT-5.6 Sol)
+
+**Stage 2 task 3 is complete.** Added the single-token fused Gated DeltaNet K2
+kernel, a literal random-state CPU oracle, a three-step recurrent test, and an
+honest >=1 GB performance benchmark. Both the `<1e-4` correctness gate and the
+`<=15 us` K2 budget are green.
+
+### 1. K2 interface, ownership, and arithmetic
+
+Added `src/gdn.h` and `src/kernels/gdn.hip`. One workgroup owns each of the 48
+v-heads. In one launch the kernel performs:
+
+- the causal depthwise width-4 convolution and history shift for q, k, and v;
+- SiLU and per-head q/k L2 normalization with D5's epsilon-as-floor semantics;
+- beta sigmoid and guarded softplus/decay scalar arithmetic;
+- fp32 128x128 delta-state decay, prediction error, rank-1 update, and query;
+- per-head output RMSNorm and SiLU(z) gating; and
+- the exact `h % 16` q/k broadcast for 48 v-heads.
+
+The convolution state is ping-ponged. All heads read an immutable old bank;
+heads 0–15 exclusively write the shared q/k histories, and every v-head writes its
+unique v history. This avoids an otherwise unavoidable cross-workgroup in-place
+race and is recorded as DECISIONS D10. The recurrent matrices are updated in place
+because heads are independent; Stage 3 will select their rollback bank.
+
+The final 512-thread mapping assigns four threads to every output column and keeps
+32 decayed state elements per thread. Wave shuffles replace the block-wide q/k and
+RMS reduction trees. Non-temporal state loads/stores are load-bearing: the same
+correct kernel measured 16.53 us with default cache policy and 13.72 us streaming.
+Final gfx1201 metadata is 128 VGPR, 30 SGPR, 4,820 B LDS, zero private segment, and
+zero VGPR/SGPR spills.
+
+### 2. Three-step random-state correctness gate
+
+Command:
+
+```bash
+./build/release/tests/test_gpu_gdn
+```
+
+The CPU side implements PLAN §4.3 literally and compares all 6,144 gated outputs,
+all 786,432 recurrent-state values, and all 30,720 convolution-history values after
+each of three sequential steps. Inputs, weights, histories, and states are
+deterministic random fp32 values. One q/k head has zero convolution weights to hit
+D5's L2 epsilon floor, and the final step forces alpha+dt above 20 to hit the
+guarded linear softplus branch.
+
+Result:
+
+```text
+GREEN — 3 recurrent steps; gated max 7.15e-07,
+        state max 1.02e-08, conv max 0; 2,469,912 checks
+```
+
+The required max-absolute bound is `1e-4`; no tolerance was adjusted.
+
+### 3. Honest K2 latency gate
+
+Command:
+
+```bash
+./build/release/gdn_bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf
+```
+
+The benchmark uses `GpuWeights` for native gfx1201 selection and D4's display
+guard, then cycles 318 independent random recurrent-state banks. Those banks alone
+are 1,000,341,504 distinct bytes per pass, plus distinct convolution banks, so the
+64 MiB Infinity Cache cannot manufacture the result. Five timed passes after a
+full warmup reported:
+
+```text
+device: AMD Radeon AI PRO R9700 (gfx1201), PCI 0000:03:00.0, displays 0
+K2: 318 independent states, 1.000 GB distinct state/pass,
+    mean 13.72 us, sd 0.15 us, target <= 15: GREEN
+```
+
+### 4. Full regression suite
+
+```bash
+git diff --check
+make -j$(nproc) test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_gdn`, `test_gpu_gemv`,
+`test_gpu_upload`, `test_quants`, `test_repack`, `test_compare_gate.py`, and
+`test_compare_tokens.py` all PASS. Every HIP compile line used
+`--offload-arch=gfx1201` exactly.
+
+**NEXT:** Stage 2 task 4 in PLAN order: implement A2 attention decode plus fp16 KV
+cache append, and validate q/k norm, partial MRoPE, GQA mapping, causal softmax, and
+sigmoid gating against a naive CPU reference before performance work.

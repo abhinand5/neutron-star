@@ -68,6 +68,10 @@ $(BUILDDIR)/gemv_bench: bench/gemv_bench.hip $(filter-out $(BUILDDIR)/src/main.c
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) -o $@
 
+$(BUILDDIR)/gdn_bench: bench/gdn_bench.hip $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))
+	@mkdir -p $(dir $@)
+	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) -o $@
+
 $(BUILDDIR)/%: bench/%.hip
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) $< -o $@

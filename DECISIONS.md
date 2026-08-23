@@ -517,3 +517,28 @@ guard (0.0006 < 0.0606 reference drift). Worst ns cosine is 0.99779370 against t
 D6 control floor 0.99598770. Three mixed prompts then produced 64/64-token greedy
 continuations: ns matched the complete stepwise reference path in all three; the
 batched path also matched on p2/p3 and diverged from ns/stepwise at p1 token 26.
+
+---
+
+## D10 — K2 convolution history is ping-ponged; q/k owner heads write the next bank
+
+**Date:** 2026-08-23 (Stage 2 task 3)
+**Clarifies:** PLAN §7.4's choice for the q/k history shared by three v-heads.
+
+K2 launches one workgroup per v-head so all 48 recurrent matrices run in parallel.
+V-head `h` consumes q/k head `h % 16`; therefore three workgroups read each q/k
+convolution history. Updating that history in place is a real cross-workgroup race:
+one consumer can observe another workgroup's shifted state, and a block-local
+barrier cannot fix it.
+
+The K2 interface consequently requires distinct old/new convolution-state banks.
+All 48 workgroups read the immutable old bank. Heads 0–15 exclusively write their
+corresponding q/k histories to the new bank, while every v-head writes its unique v
+history. This covers all 10,240 channels once without a grid barrier or duplicate
+q/k storage. The 48 independent 128×128 recurrent matrices remain in-place for
+single-token Stage 2; Stage 3's accept/rollback path will select the full state bank
+as already required by PLAN §4.4.
+
+This is not additional model state or weight transformation. It is the two-bank
+execution of the exact three-token history already budgeted by the plan, and it
+makes the ownership rule explicit for graph capture and MTP rollback.
