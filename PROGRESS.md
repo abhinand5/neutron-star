@@ -454,3 +454,111 @@ difference living in the other one.
 205-position sweep. That is the last known gap between ns and the oracle, and it is
 the same arithmetic PLAN §7.5 specifies for the Stage 2 GEMV kernels. Stage 2 stays
 blocked behind G1.
+
+---
+
+## ESCALATE — 2026-08-22: G1 is one token short; is the gate measuring the right thing?
+
+Raised per PLAN §0.3 (two sessions on one issue → write it up, hand it off). Flagged
+for a stronger model. **No further sessions should be spent grinding on this without
+a decision on the question in §3 below** — it is a judgement call about the gate's
+premise, not a missing piece of code.
+
+### 1. Where things stand
+
+G1 requires top-1 agreement ≥ 99.5% vs llama.cpp over ≥192 positions. Measured over
+205 positions (4 prompts: prose, Python, literary, technical):
+
+| | top-1 | worst cosine |
+|---|---|---|
+| **ns** vs llama.cpp CPU stepwise | **203/205 = 0.9902** | 0.99779 |
+| llama.cpp batched vs llama.cpp stepwise (control) | 204/205 = 0.9951 | 0.99599 |
+
+ns is **one token** below the gate. Its cosine agreement is *inside* the reference's
+own reproducibility band (better than the control on p2/p3, marginally worse on
+p1/p4). Everything upstream is verified: dequant is bit-exact vs llama.cpp over 4.89M
+elements (§ session 2), and `blk.62.attn_qkv.weight` was checked exhaustively —
+bit-exact across all 204800 blocks.
+
+### 2. The two failing tokens are coin-flips
+
+```
+p1 pos  9: contested 733 vs 561
+   ns         logit[733]=15.9099  logit[561]=15.9105   margin=-0.0006  -> 561
+   ref step   logit[733]=16.1223  logit[561]=15.9211   margin=+0.2013  -> 733
+   ref batch  logit[733]=16.0617  logit[561]=15.9658   margin=+0.0959  -> 733
+
+p4 pos 29: contested 561 vs 1061
+   ns         logit[561]=15.2868  logit[1061]=15.3746  margin=-0.0878  -> 1061
+   ref step   logit[561]=15.4324  logit[1061]=15.4181  margin=+0.0143  -> 561
+   ref batch  logit[561]=15.2673  logit[1061]=15.3755  margin=-0.1082  -> 1061   <-- agrees with ns
+```
+
+p1 pos 9 turns on **0.0006 of a logit**. At p4 pos 29 **llama.cpp's own batched path
+makes the same call ns does** and disagrees with llama.cpp's stepwise path — that is
+the single token the control itself gets "wrong". So of ns's two misses, one is a
+position where the oracle is not self-consistent, and the other is a 6e-4 tie.
+
+### 3. The actual question for the escalation
+
+**Is bit-parity with a lossy oracle the right target?**
+
+llama.cpp quantizes activations to int8 before every K-quant matmul
+(`vec_dot_type = GGML_TYPE_Q8_K`; root cause in DECISIONS D7). ns's cpu_ref
+dequantizes weights exactly and accumulates in fp32 — it is the *more accurate*
+engine. Chasing the last two tokens means deliberately reproducing llama.cpp's
+rounding error, on positions where llama.cpp cannot reproduce itself.
+
+Three options, no strong recommendation from this session:
+
+- **(a) Finish the emulation.** `--ggml-act-quant` currently emulates only the
+  rounding (quantize → dequantize → fp32 dot). ggml does a true integer dot with
+  int32 accumulation and per-block `bsums`/`dmin` correction
+  (`ggml_vec_dot_q5_K_q8_K` et al.). Porting that exactly is bounded, testable, and
+  **not throwaway — PLAN §7.5 specifies this same arithmetic for the Stage 2 GEMV
+  kernels**, so cpu_ref would end up sharing numerics with the shipping GPU path.
+  Risk: this is the third consecutive "one more step and it closes".
+- **(b) Amend the gate** (DECISIONS D6 already made the cosine bar self-calibrating
+  against the control). Same logic applied to top-1 would read: *ns must agree with
+  llama.cpp at least as often as llama.cpp agrees with itself, ±1 token on a 205
+  sample*. ns would pass. Needs a second opinion — it is one step from
+  rationalising a failure.
+- **(c) Declare the gate's premise wrong** and re-target parity at the exact-fp32
+  path, treating llama.cpp as a quality reference rather than a bit-oracle. Largest
+  change; would need a different way to catch real bugs.
+
+### 4. Reproduce in ~15 minutes
+
+```bash
+M=~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf
+TOK=$(cat tests/prompts/p1.tokens)          # or p4
+make && make tools
+./build/release/tools/oracle_logits -m $M -t "$TOK" -o /tmp/ref_step.bin
+./build/release/tools/oracle_logits -m $M -t "$TOK" --batched -o /tmp/ref_batch.bin
+./build/release/ns eval $M --tokens "$TOK" --ggml-act-quant --dump-logits /tmp/ns.bin
+python3 tools/compare.py /tmp/ns.bin /tmp/ref_step.bin --control /tmp/ref_batch.bin \
+        --vocab 248320 --verbose
+```
+
+Layer bisection, if it is ever needed again (this is how D7 was found):
+
+```bash
+./build/release/tools/oracle_activations -m $M -t "$TOK" --pos N --filter l_out -o /tmp/ref_act.bin
+./build/release/ns eval $M --tokens "$TOK" --debug-pos N --dump-activations /tmp/ns_act.bin
+python3 tools/compare_activations.py /tmp/ns_act.bin /tmp/ref_act.bin
+./build/release/tools/quant_oracle --tensor blk.62.attn_qkv.weight   # exhaustive, per block
+```
+
+**Two traps that cost this session hours** (both in DECISIONS D7): ggml stores the GDN
+recurrent state *transposed* (`s_out[j*S+i] = S[i][j]`) so a naive element-wise
+compare reads 0.02 when the true agreement is 0.9996; and ns's `conv_output_silu`
+dump shows a uniform per-head rms of 1/sqrt(128) because `q`/`k` alias into the conv
+buffer and the in-place L2-norm has already run — a diagnostic artifact, not a bug.
+
+### 5. Parallel work available while this is parked
+
+Nothing here is blocked on G1 and none of it needs the GPU:
+tokenizer (§4.5, currently shelling out to `llama-tokenize`); `tools/compare.py`
+layer-bisect mode; Stage 2 scaffolding that does not touch numerics (VRAM arena,
+§5.4 repack + its round-trip test, kernel launch-config table). Stage 2's *kernels*
+stay blocked behind G1 per §0.3.
