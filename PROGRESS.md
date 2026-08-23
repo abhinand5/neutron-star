@@ -774,3 +774,34 @@ with the counts above.
 **NEXT:** Stage 2 task 1 in PLAN order: VRAM arena + bit-preserving per-format
 repack/upload, with repack -> unpack bit-exact tests. Re-read PLAN Part 2 and §7
 before touching HIP; retain the R9700 display guard and select by `gcnArchName`.
+
+---
+
+## 2026-08-23 — Session 6 (educational project guide, GPT-5.6 Sol)
+
+Added `GUIDE.md`, a reader-first explanation of the project intended to be read in
+parallel with implementation. It covers the inference loop, prefill vs decode,
+specialization thesis, bandwidth roofline, gfx1201 execution model and safety
+rules, corrected Qwen3.8-27B math, GDN and attention state, GGUF/quant formats,
+Q8_K activation arithmetic, repack vs requantization, planned VRAM/kernel design,
+MTP and rollback, the oracle chain and D6/D8/D9 gate semantics, honest benchmarking,
+the staged roadmap, current/future source layout, common failure modes, and a
+glossary. It explicitly treats PLAN as the base specification, DECISIONS as its
+amendments, and PROGRESS as the live state rather than becoming a competing spec.
+
+Documentation checks:
+
+```bash
+wc -l -w GUIDE.md
+# 1457 lines, 8569 words
+awk 'BEGIN{f=0} /^```/{f=!f} END{print f ? "unclosed code fence" : "code fences balanced"; exit f}' GUIDE.md
+# code fences balanced (38 fence markers)
+git diff --cached --check
+# clean
+```
+
+This was documentation-only; no source, build, model, or benchmark result changed,
+so compute tests were not rerun.
+
+**NEXT:** implementation remains Stage 2 task 1: VRAM arena, bit-preserving
+per-format repack/upload, and repack -> unpack bit-exact tests.
