@@ -5,6 +5,7 @@
 // Chat/complete/--profile arrive with the decode engine (Stage 2).
 // ============================================================================
 #include "ns.h"
+#include "forward.h"
 #include "gpu.h"
 
 #include <algorithm>
@@ -43,7 +44,29 @@ static int usage() {
             "  runs the CPU reference forward pass (PLAN §4.3) over a token\n"
             "  sequence and prints the top-k predictions. --generate feeds greedy\n"
             "  argmax tokens back into the model and writes raw int32 token IDs.\n");
+    fprintf(stderr,
+            "\n"
+            "       ns gpu-eval <model.gguf> --tokens a,b,c [--topk N]\n"
+            "           [--all-pos] [--dump-logits FILE] [--generate N]\n"
+            "           [--dump-tokens FILE] [--ctx N] [--fp32-gemv]\n"
+            "  runs the eager gfx1201 decode engine. Integer Q8_K GEMV is the\n"
+            "  default; --fp32-gemv selects the dequant-and-FMA diagnostic path.\n");
     return 2;
+}
+
+static std::vector<int32_t> parse_tokens(const std::string& tokens_csv) {
+    std::vector<int32_t> tokens;
+    size_t position = 0;
+    while (position <= tokens_csv.size()) {
+        const size_t end = tokens_csv.find(',', position);
+        const std::string piece = tokens_csv.substr(
+            position, end == std::string::npos ? end : end - position);
+        if (!piece.empty())
+            tokens.push_back((int32_t)strtol(piece.c_str(), nullptr, 10));
+        if (end == std::string::npos) break;
+        position = end + 1;
+    }
+    return tokens;
 }
 
 static int cmd_eval(const std::string& path, const std::string& tokens_csv, int topk,
@@ -132,6 +155,128 @@ static int cmd_eval(const std::string& path, const std::string& tokens_csv, int 
     if (!act_path.empty()) printf("activations written to %s\n", act_path.c_str());
     if (dump) { fclose(dump); printf("logits written to %s\n", dump_path.c_str()); }
     printf("L2-norm eps floor bound %" PRId64 " times\n", ref_l2_eps_hits());
+    return 0;
+}
+
+static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
+                        int topk, bool all_pos, const std::string& dump_path,
+                        int generate, const std::string& token_path,
+                        int requested_context, bool fp32_gemv,
+                        bool allow_display) {
+    std::vector<int32_t> tokens = parse_tokens(tokens_csv);
+    if (tokens.empty()) {
+        fprintf(stderr, "ns: --tokens is empty\n");
+        return 2;
+    }
+    const int needed_context =
+        (int)tokens.size() + std::max(generate - 1, 0);
+    GpuEngineOptions options;
+    options.max_context = requested_context > 0
+        ? requested_context : std::max(256, needed_context);
+    options.allow_display = allow_display;
+    options.integer_gemv = !fp32_gemv;
+    if (options.max_context < needed_context) {
+        fprintf(stderr, "ns: --ctx %d is smaller than the requested %d-token run\n",
+                options.max_context, needed_context);
+        return 2;
+    }
+
+    GpuEngine engine;
+    std::string error;
+    const double load_start = now_sec();
+    if (!engine.load(path, options, &error)) {
+        fprintf(stderr, "ns: GPU load failed: %s\n", error.c_str());
+        return 1;
+    }
+    const GpuLoadStats& weight_stats = engine.weight_stats();
+    const GpuRuntimeStats& runtime_stats = engine.runtime_stats();
+    printf("loaded %s on %s (%s), PCI %s in %.2f s\n",
+           engine.config().name.c_str(), weight_stats.device_name.c_str(),
+           weight_stats.device_arch.c_str(), weight_stats.device_pci.c_str(),
+           now_sec() - load_start);
+    printf("weights %.3f GiB; runtime %.3f GiB (state %.3f, KV %.3f, scratch %.3f); "
+           "ctx %d; %s GEMV\n",
+           weight_stats.arena_bytes / GiB, runtime_stats.arena_bytes / GiB,
+           runtime_stats.state_bytes / GiB, runtime_stats.kv_bytes / GiB,
+           runtime_stats.scratch_bytes / GiB, runtime_stats.max_context,
+           runtime_stats.integer_gemv ? "Q8_K integer" : "fp32-dequant");
+
+    std::vector<float> logits;
+    FILE* dump = dump_path.empty() ? nullptr : fopen(dump_path.c_str(), "wb");
+    if (!dump_path.empty() && !dump) {
+        fprintf(stderr, "ns: cannot write %s\n", dump_path.c_str());
+        return 1;
+    }
+    for (size_t index = 0; index < tokens.size(); index++) {
+        const double start = now_sec();
+        if (!engine.forward(tokens[index], (int32_t)index, &logits, &error)) {
+            fprintf(stderr, "ns: GPU forward failed at position %zu: %s\n",
+                    index, error.c_str());
+            if (dump) fclose(dump);
+            return 1;
+        }
+        const double elapsed = now_sec() - start;
+        if (dump && fwrite(logits.data(), sizeof(float), logits.size(), dump) !=
+                        logits.size()) {
+            fprintf(stderr, "ns: short write to %s\n", dump_path.c_str());
+            fclose(dump);
+            return 1;
+        }
+        if (!all_pos && index + 1 != tokens.size()) {
+            printf("  pos %3zu token %6d  %.3f s\n", index, tokens[index], elapsed);
+            continue;
+        }
+        std::vector<int> order(logits.size());
+        for (size_t item = 0; item < order.size(); item++) order[item] = (int)item;
+        const int count = std::min<int>(topk, (int)order.size());
+        std::partial_sort(order.begin(), order.begin() + count, order.end(),
+                          [&](int left, int right) {
+                              return logits[left] > logits[right];
+                          });
+        double sum = 0.0;
+        const float maximum = logits[order[0]];
+        for (float value : logits) sum += exp((double)(value - maximum));
+        printf("  pos %3zu token %6d  %.3f s  top%d:", index, tokens[index],
+               elapsed, count);
+        for (int item = 0; item < count; item++)
+            printf(" [%d]=%.4f(p=%.3f)", order[item], logits[order[item]],
+                   exp((double)(logits[order[item]] - maximum)) / sum);
+        printf("\n");
+    }
+
+    std::vector<int32_t> generated;
+    generated.reserve((size_t)generate);
+    for (int index = 0; index < generate; index++) {
+        const int32_t next = (int32_t)std::distance(
+            logits.begin(), std::max_element(logits.begin(), logits.end()));
+        generated.push_back(next);
+        printf("  gen %3d -> token %6d  logit %.4f\n", index, next,
+               logits[(size_t)next]);
+        if (index + 1 < generate &&
+            !engine.forward(next, (int32_t)tokens.size() + index, &logits, &error)) {
+            fprintf(stderr, "ns: GPU generation failed: %s\n", error.c_str());
+            if (dump) fclose(dump);
+            return 1;
+        }
+    }
+    if (!token_path.empty()) {
+        FILE* token_dump = fopen(token_path.c_str(), "wb");
+        if (!token_dump || fwrite(generated.data(), sizeof(int32_t), generated.size(),
+                                  token_dump) != generated.size()) {
+            fprintf(stderr, "ns: cannot write generated tokens to %s\n",
+                    token_path.c_str());
+            if (token_dump) fclose(token_dump);
+            if (dump) fclose(dump);
+            return 1;
+        }
+        fclose(token_dump);
+        printf("generated tokens written to %s (%zu raw int32 IDs)\n",
+               token_path.c_str(), generated.size());
+    }
+    if (dump) {
+        fclose(dump);
+        printf("logits written to %s\n", dump_path.c_str());
+    }
     return 0;
 }
 
@@ -288,6 +433,38 @@ int main(int argc, char** argv) {
         if (act_quant) ref_set_act_quant(true);
         return cmd_eval(argv[2], tokens, topk, all_pos, dump, generate, token_dump,
                         debug_pos, act);
+    }
+    if (cmd == "gpu-eval") {
+        if (argc < 3) return usage();
+        std::string tokens, dump, token_dump;
+        int topk = 5;
+        int generate = 0;
+        int context = 0;
+        bool all_pos = false;
+        bool fp32_gemv = false;
+        bool allow_display = false;
+        for (int index = 3; index < argc; index++) {
+            const std::string argument = argv[index];
+            if (argument == "--tokens" && index + 1 < argc) tokens = argv[++index];
+            else if (argument == "--topk" && index + 1 < argc)
+                topk = atoi(argv[++index]);
+            else if (argument == "--dump-logits" && index + 1 < argc)
+                dump = argv[++index];
+            else if (argument == "--all-pos") all_pos = true;
+            else if (argument == "--generate" && index + 1 < argc)
+                generate = atoi(argv[++index]);
+            else if (argument == "--dump-tokens" && index + 1 < argc)
+                token_dump = argv[++index];
+            else if (argument == "--ctx" && index + 1 < argc)
+                context = atoi(argv[++index]);
+            else if (argument == "--fp32-gemv") fp32_gemv = true;
+            else if (argument == "--allow-display") allow_display = true;
+            else return usage();
+        }
+        if (generate < 0 || context < 0 || topk <= 0 ||
+            (!token_dump.empty() && generate == 0)) return usage();
+        return cmd_gpu_eval(argv[2], tokens, topk, all_pos, dump, generate,
+                            token_dump, context, fp32_gemv, allow_display);
     }
     if (cmd == "inspect") {
         if (argc < 3) return usage();

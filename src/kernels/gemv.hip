@@ -176,6 +176,57 @@ __device__ int q3_scale(const PackedBlockView& weight, int index) {
 template <int Type>
 __device__ float dot_quant_block(const PackedBlockView& weight, const float* activation);
 
+template <int Type>
+__device__ void dequant_quant_block(const PackedBlockView& weight, float* output);
+
+template <>
+__device__ void dequant_quant_block<NS_Q4_K>(const PackedBlockView& weight,
+                                              float* output) {
+    const float d = fp16_bits_to_float(weight.u16<140, 4>(0));
+    const float dmin = fp16_bits_to_float(weight.u16<140, 4>(2));
+    for (int group = 0; group < 4; group++) {
+        uint8_t scale0, min0, scale1, min1;
+        scale_min_q4<128>(weight, 2 * group, &scale0, &min0);
+        scale_min_q4<128>(weight, 2 * group + 1, &scale1, &min1);
+        for (int lane = 0; lane < 32; lane++) {
+            const uint8_t packed = weight.byte<0, 128>(group * 32 + lane);
+            output[group * 64 + lane] =
+                d * scale0 * (packed & 0x0f) - dmin * min0;
+            output[group * 64 + 32 + lane] =
+                d * scale1 * (packed >> 4) - dmin * min1;
+        }
+    }
+}
+
+template <>
+__device__ void dequant_quant_block<NS_Q6_K>(const PackedBlockView& weight,
+                                              float* output) {
+    const float d = fp16_bits_to_float(weight.u16<208, 2>(0));
+    for (int half = 0; half < 2; half++) {
+        for (int lane = 0; lane < 32; lane++) {
+            const int scale_lane = lane / 16;
+            const uint8_t high = weight.byte<128, 64>(half * 32 + lane);
+            const int q0 = (weight.byte<0, 128>(half * 64 + lane) & 0x0f) |
+                           (((high >> 0) & 3) << 4);
+            const int q1 = (weight.byte<0, 128>(half * 64 + 32 + lane) & 0x0f) |
+                           (((high >> 2) & 3) << 4);
+            const int q2 = (weight.byte<0, 128>(half * 64 + lane) >> 4) |
+                           (((high >> 4) & 3) << 4);
+            const int q3 = (weight.byte<0, 128>(half * 64 + 32 + lane) >> 4) |
+                           (((high >> 6) & 3) << 4);
+            const int scale_base = half * 8 + scale_lane;
+            const int8_t s0 = (int8_t)weight.byte<192, 16>(scale_base + 0);
+            const int8_t s1 = (int8_t)weight.byte<192, 16>(scale_base + 2);
+            const int8_t s2 = (int8_t)weight.byte<192, 16>(scale_base + 4);
+            const int8_t s3 = (int8_t)weight.byte<192, 16>(scale_base + 6);
+            output[half * 128 + lane + 0] = d * s0 * (q0 - 32);
+            output[half * 128 + lane + 32] = d * s1 * (q1 - 32);
+            output[half * 128 + lane + 64] = d * s2 * (q2 - 32);
+            output[half * 128 + lane + 96] = d * s3 * (q3 - 32);
+        }
+    }
+}
+
 __device__ int pack_bytes(int a, int b, int c, int d) {
     return (int)((uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
                  ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24));
@@ -829,6 +880,27 @@ void gemv_q8_K_split_kernel(const uint8_t* weights, RepackLayout layout,
     }
 }
 
+template <int Type>
+__global__ void get_row_quant_kernel(const uint8_t* weights, RepackLayout layout,
+                                     float* output, int rows, int elements_per_row,
+                                     int selected_row) {
+    const int quant_block = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int blocks_per_row = elements_per_row / layout.block_elements;
+    if (quant_block >= blocks_per_row) return;
+    const int tile_start = (selected_row / REPACK_ROW_TILE) * REPACK_ROW_TILE;
+    const int row_in_tile = selected_row - tile_start;
+    const int tile_rows = rows - tile_start < REPACK_ROW_TILE
+                              ? rows - tile_start : REPACK_ROW_TILE;
+    const size_t row_bytes = (size_t)blocks_per_row * layout.block_bytes;
+    const uint8_t* tile = weights + (size_t)tile_start * row_bytes;
+    const PackedBlockView view = {
+        tile + (size_t)quant_block * tile_rows * layout.block_bytes,
+        tile_rows, row_in_tile,
+    };
+    dequant_quant_block<Type>(
+        view, output + (size_t)quant_block * layout.block_elements);
+}
+
 static bool hip_result(hipError_t result, const char* operation, std::string* error) {
     if (result == hipSuccess) return true;
     if (error)
@@ -886,6 +958,17 @@ static void launch_q8_K(const GpuTensor& tensor, const block_q8_K* input,
                        grid, block, 0, stream,
                        tensor.data, tensor.layout, input, output,
                        (int)tensor.ne[1], (int)tensor.ne[0]);
+}
+
+template <int Type>
+static void launch_get_row(const GpuTensor& tensor, int64_t row, float* output,
+                           hipStream_t stream) {
+    const int blocks = (int)(tensor.ne[0] / tensor.layout.block_elements);
+    constexpr int threads = 64;
+    const dim3 grid((uint32_t)(blocks + threads - 1) / threads);
+    hipLaunchKernelGGL((get_row_quant_kernel<Type>), grid, dim3(threads), 0, stream,
+                       tensor.data, tensor.layout, output, (int)tensor.ne[1],
+                       (int)tensor.ne[0], (int)row);
 }
 
 }  // namespace
@@ -984,6 +1067,26 @@ bool gpu_gemv_q8_K(const GpuTensor& tensor, const block_q8_K* input, float* outp
             return false;
     }
     return hip_result(hipGetLastError(), "launch Q8_K integer GEMV", error);
+}
+
+bool gpu_get_row_f32(const GpuTensor& tensor, int64_t row, float* output,
+                     hipStream_t stream, std::string* error) {
+    if (tensor.n_dims != 2 || tensor.ne[0] <= 0 || tensor.ne[0] > INT32_MAX ||
+        tensor.ne[1] <= 0 || tensor.ne[1] > INT32_MAX || row < 0 ||
+        row >= tensor.ne[1] || !tensor.data || !output || !stream) {
+        if (error) *error = tensor.name + ": invalid embedding row arguments";
+        return false;
+    }
+    switch (tensor.type) {
+        case NS_Q4_K: launch_get_row<NS_Q4_K>(tensor, row, output, stream); break;
+        case NS_Q6_K: launch_get_row<NS_Q6_K>(tensor, row, output, stream); break;
+        default:
+            if (error)
+                *error = tensor.name + ": embedding gather is unavailable for " +
+                         std::string(type_info(tensor.type).name);
+            return false;
+    }
+    return hip_result(hipGetLastError(), "launch embedding gather", error);
 }
 
 }  // namespace ns

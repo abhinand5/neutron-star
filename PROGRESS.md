@@ -1205,3 +1205,144 @@ bandwidth (six query heads reread a shared KV head).
 **NEXT:** Stage 2 task 5: add `forward.cpp`, activation/state/KV arenas, and wire an
 eager full decode step from the validated GEMV, K2, and A2 primitives. Then run the
 GPU path through G1's parity harness before graph capture or performance tuning.
+
+---
+
+## 2026-08-23 — Session 11 (Stage 2 task 5: eager GPU decode, GPT-5.6 Sol)
+
+**Stage 2 task 5 is complete.** The eager gfx1201 path now executes one complete
+Qwen3.8-27B main-model decode step, and the Q4_K_XL GPU engine passes G1's full
+205-position teacher-forced gate plus all three established 64-token recurrent
+continuations. Gate G2a is not declared yet: its stricter 256-token and second-GGUF
+clauses remain.
+
+### 1. Deep runtime module and missing primitives
+
+Added `src/forward.h/.cpp`. `GpuEngine` owns immutable `GpuWeights`, resolved layer
+bindings, mutable recurrent state, fp16 KV cache, scratch buffers, cache length, and
+failure poisoning behind a synchronous `(token, position) -> host logits` API. A
+caller never sees quant layouts or individual allocations.
+
+The runtime uses one 256-byte-aligned static arena and allocates nothing per token.
+It contains:
+
+- two ping-pong convolution banks and all 48 in-place fp32 GDN states;
+- independent token-major fp16 K/V regions for the 16 main attention layers;
+- hidden/norm/residual buffers, all projection/FFN scratch, one reusable Q8_K
+  activation buffer, and the 248,320 fp32 logits; and
+- a capacity fixed at load (`--ctx`), with bounds enforced before launch.
+
+At context 31 the Q4 run reported a 0.155 GiB runtime arena: 0.152 GiB state,
+0.002 GiB KV, and 0.001 GiB scratch. At the v1 limit of 32,768 this layout is
+2.153 GiB (2.000 GiB KV plus the same state/scratch), matching PLAN §5.5.
+
+Added `src/ops.h` / `src/kernels/ops.hip` for full-vector RMSNorm, residual add,
+and SiLU(gate)*up. Added `gpu_get_row_f32` to the GEMV module for token embedding:
+it dequantizes one selected repacked row directly from exact GGUF bits. Both blessed
+files' embedding formats are covered (Q4_K and Q6_K). The CLI now exposes
+`ns gpu-eval ...`, defaults to the shipping Q8_K integer GEMV path, retains
+`--fp32-gemv` as a diagnostic, enforces the D4 display guard, and supports raw
+logit/token dumps.
+
+### 2. Primitive, embedding, and full-forward tests
+
+Commands and results:
+
+```bash
+./build/release/tests/test_gpu_ops
+# GREEN — RMSNorm max 0, add max 0, SiLU-mul max 5.96e-08; 39,946 checks
+
+./build/release/tests/test_gpu_gemv
+# GREEN — 42 distinct (m,k,type) cases, 4,464,225,280 weight bytes,
+#         1,842,198 checks
+
+./build/release/tests/test_gpu_forward
+# GREEN — 64-layer eager decode top-1 2614; reset replay is bit-exact; 20 checks
+```
+
+The GEMV test now gathers rows 0, 12,345, and 248,319 from each blessed embedding
+matrix and compares all 5,120 fp32 values bit-for-bit with CPU dequantization. It
+also rejects an out-of-range row before retaining all previous real-weight GEMV and
+Q8_K coverage. The full-forward test executes Q4_K_XL token 760 with context one,
+checks top-1 token 2614, exhausts the cache bound, resets all recurrent state, and
+proves the repeated 248,320-logit result is bit-identical.
+
+Q5_K_XL also completed the same 64-layer smoke path using its Q6_K embedding and
+Q8_0 output head:
+
+```text
+weights 19.433 GiB; runtime 0.153 GiB; ctx 1; Q8_K integer GEMV
+pos 0 token 760: top-1 [2614]=9.3325
+```
+
+### 3. Q4_K_XL GPU teacher-forced parity (205 positions)
+
+GPU dumps were generated from all committed prompt tokens:
+
+```bash
+for prompt in p1 p2 p3 p4; do
+  prompt_tokens=$(<tests/prompts/${prompt}.tokens)
+  ./build/release/ns gpu-eval \
+    ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+    --tokens "$prompt_tokens" --ctx 128 \
+    --dump-logits "/tmp/ns_gpu_${prompt}.bin"
+done
+```
+
+The four files were passed together to `tools/compare.py` with the preserved
+stepwise/batched llama.cpp CPU references, `--vocab 248320 --guard-side ns`:
+
+| prompt | positions | raw top-1 | triangulated | GPU worst cosine | control worst |
+|---|---:|---:|---:|---:|---:|
+| p1 | 31 | 31/31 | 31/31 | 0.99925346 | 0.99939810 |
+| p2 | 90 | 90/90 | 90/90 | 0.99599359 | 0.99598770 |
+| p3 | 54 | 54/54 | 54/54 | 0.99849981 | 0.99801422 |
+| p4 | 30 | 29/30 | 30/30 | 0.99936014 | 0.99904758 |
+| **total** | **205** | **204/205 = 0.9951** | **205/205 = 1.0000** | **0.99599359** | **0.99598770** |
+
+Aggregate mean cosine is **0.99953379** (control 0.99954449); mean top-5 overlap
+is **0.9668**. The single raw miss, p4 position 29, matches the complete batched
+control path. The configured/self-calibrated cosine bar is 0.99598770 and the GPU
+worst is 0.99599359, so `G2a Q4 teacher-forced logits: GREEN` without an admissible
+margin exception.
+
+The eager Q4 decode after clock warmup was consistently ~0.034 s/token. This is
+an end-to-end observation over the full >16 GiB streamed model, not a G2b benchmark;
+graph capture, profiling, fusion, depth-32k, 512-token protocol, and three-run
+statistics have not happened.
+
+### 4. Real recurrent greedy parity
+
+For p1/p2/p3, the first 12 committed tokens were evaluated and each GPU engine fed
+its own argmax back for 64 generated tokens:
+
+```bash
+./build/release/ns gpu-eval "$M" --tokens "$TOK12" --ctx 80 \
+  --generate 64 --dump-tokens "/tmp/gpu_${prompt}_greedy.bin"
+python3 tools/compare_tokens.py "/tmp/gpu_${prompt}_greedy.bin" \
+  "/tmp/ref_step_${prompt}_greedy.bin" \
+  "/tmp/ref_batch_${prompt}_greedy.bin"
+```
+
+All three are GREEN and **64/64 bit-identical to the stepwise reference**. p2 and
+p3 also equal the batched reference; p1 follows the stepwise path and differs from
+the batched path first at token 26, exactly as recorded at G1. This proves recurrent
+GDN, convolution-bank flips, fp16 KV append, and cache length remain coherent across
+whole-path feedback, not merely teacher forcing.
+
+### 5. Full regression suite
+
+```bash
+git diff --check
+make -j$(nproc) test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. Every
+HIP compile line used `--offload-arch=gfx1201` exactly.
+
+**NEXT:** Stage 2 task 6: capture the eager sequence into a HIP graph and add
+`--profile` per-kernel accounting. Keep G2a open until 256-token greedy parity and
+the equivalent Q5_K_XL oracle sweep are green; keep G2b open until the formal
+depth-0/depth-32768 512-token benchmark protocol is complete.

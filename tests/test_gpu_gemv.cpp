@@ -156,6 +156,35 @@ static size_t test_model(const std::string& path, std::set<Shape>* covered,
     std::vector<float> gpu_output((size_t)max_rows);
     size_t tested_bytes = 0;
 
+    const GgufTensor* embedding_source = file.tensor("token_embd.weight");
+    const GpuTensor* embedding_target = weights.tensor("token_embd.weight");
+    CHECK(embedding_source != nullptr);
+    CHECK(embedding_target != nullptr);
+    const TypeInfo& embedding_info = type_info(embedding_source->type);
+    const size_t embedding_row_bytes =
+        (size_t)(embedding_source->ne[0] / embedding_info.blck) *
+        embedding_info.bytes;
+    const int64_t embedding_rows[] = {0, 12345, embedding_source->ne[1] - 1};
+    for (int64_t row : embedding_rows) {
+        cpu_output.resize((size_t)embedding_source->ne[0]);
+        gpu_output.resize((size_t)embedding_source->ne[0]);
+        CHECK(dequant_row(embedding_source->type,
+                          embedding_source->data + (size_t)row * embedding_row_bytes,
+                          cpu_output.data(), embedding_source->ne[0]));
+        CHECK(gpu_get_row_f32(*embedding_target, row, device.output,
+                              weights.stream(), &error));
+        HIP_CHECK(hipMemcpyAsync(gpu_output.data(), device.output,
+                                 gpu_output.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipStreamSynchronize(weights.stream()));
+        CHECK(memcmp(cpu_output.data(), gpu_output.data(),
+                     gpu_output.size() * sizeof(float)) == 0);
+    }
+    CHECK(!gpu_get_row_f32(*embedding_target, embedding_source->ne[1],
+                           device.output, weights.stream(), &error));
+    cpu_output.resize((size_t)max_rows);
+    gpu_output.resize((size_t)max_rows);
+
     for (size_t case_index = 0; case_index < cases.size(); case_index++) {
         const GgufTensor& source = *cases[case_index];
         const GpuTensor* target = weights.tensor(source.name);

@@ -25,4 +25,9 @@ bool gpu_quantize_q8_K(const float* input, block_q8_K* output, int64_t elements,
 bool gpu_gemv_q8_K(const GpuTensor& tensor, const block_q8_K* input, float* output,
                    hipStream_t stream, std::string* error = nullptr);
 
+// Dequantizes one output row of a repacked matrix. This is the token-embedding
+// gather path; unlike GEMV it touches only the selected row's exact GGUF bits.
+bool gpu_get_row_f32(const GpuTensor& tensor, int64_t row, float* output,
+                     hipStream_t stream, std::string* error = nullptr);
+
 }  // namespace ns
