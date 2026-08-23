@@ -86,6 +86,9 @@ else
 test: $(TESTBINS)
 	@fail=0; for t in $(TESTBINS); do printf '%-40s' "$$t"; \
 	  if $$t > /tmp/ns_test.log 2>&1; then echo PASS; else echo FAIL; cat /tmp/ns_test.log; fail=1; fi; \
+	done; \
+	for t in $(wildcard tests/*.py); do printf '%-40s' "$$t"; \
+	  if python3 $$t > /tmp/ns_test.log 2>&1; then echo PASS; else echo FAIL; cat /tmp/ns_test.log; fail=1; fi; \
 	done; exit $$fail
 endif
 
