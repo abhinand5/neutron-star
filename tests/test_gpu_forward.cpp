@@ -47,7 +47,7 @@ int main() {
         CHECK(engine.forward(760, 0, &first, &error));
         CHECK(engine.n_past() == 1);
         CHECK(engine.runtime_stats().graph_captured);
-        CHECK(engine.runtime_stats().graph_nodes_per_parity > 1000);
+        CHECK(engine.runtime_stats().graph_nodes_per_parity > 0);
         graph_nodes = engine.runtime_stats().graph_nodes_per_parity;
         CHECK(first.size() == engine.config().n_vocab);
         CHECK(std::distance(first.begin(),
@@ -56,6 +56,13 @@ int main() {
         CHECK(engine.n_past() == 1);
         CHECK(engine.reset_state(&error));
         CHECK(engine.n_past() == 0);
+        CHECK(engine.set_benchmark_depth(0, &error));
+        CHECK(engine.benchmark_fixed_depth(760, 0, 2, &error));
+        CHECK(engine.n_past() == 0);
+        CHECK(engine.reset_state(&error));
+        CHECK(engine.forward_no_logits(760, 0, &error));
+        CHECK(engine.n_past() == 1);
+        CHECK(engine.reset_state(&error));
         CHECK(engine.forward(760, 0, &repeated, &error));
         CHECK(repeated.size() == first.size());
         CHECK(memcmp(first.data(), repeated.data(), first.size() * sizeof(float)) == 0);

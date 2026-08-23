@@ -30,6 +30,11 @@ __device__ float block_sum_256(float value, float* wave_sums) {
     return wave_sums[0];
 }
 
+__device__ int nearest_integer(float value) {
+    value = __fadd_rn(value, 12582912.0f);
+    return (__float_as_int(value) & 0x007fffff) - 0x00400000;
+}
+
 __global__ __launch_bounds__(256)
 void attention_step_kernel(AttentionStepArgs args) {
     __shared__ float q[ATTENTION_HEAD_DIM];
@@ -139,8 +144,77 @@ void attention_step_kernel(AttentionStepArgs args) {
 
     const float gate = args.qg[qg_base + ATTENTION_HEAD_DIM + dim];
     const float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
-    args.gated_output[q_head * ATTENTION_HEAD_DIM + dim] =
-        accumulator * inverse_softmax_sum * sigmoid_gate;
+    const float gated = accumulator * inverse_softmax_sum * sigmoid_gate;
+    args.gated_output[q_head * ATTENTION_HEAD_DIM + dim] = gated;
+
+    if (args.q8_output) {
+        // One attention head is exactly one Q8_K block. Reuse the now-dead q/k/v
+        // LDS arrays and the shipping quantizer's max-magnitude/lowest-index
+        // selection so A2 can hand A3 byte-identical integer activations.
+        const int lane = dim & 31;
+        const int wave = dim >> 5;
+        q[dim] = gated;
+        float maximum = fabsf(gated);
+        int maximum_index = dim;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down(maximum, offset, 32);
+            const int other_index = __shfl_down(maximum_index, offset, 32);
+            if (lane < offset &&
+                (other > maximum ||
+                 (other == maximum && other_index < maximum_index))) {
+                maximum = other;
+                maximum_index = other_index;
+            }
+        }
+        int* winner_indices = reinterpret_cast<int*>(current_v);
+        if (lane == 0) {
+            current_k[wave] = maximum;
+            winner_indices[wave] = maximum_index;
+        }
+        __syncthreads();
+        if (wave == 0) {
+            maximum = lane < 8 ? current_k[lane] : -1.0f;
+            maximum_index = lane < 8 ? winner_indices[lane] : ATTENTION_HEAD_DIM;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float other = __shfl_down(maximum, offset, 32);
+                const int other_index = __shfl_down(maximum_index, offset, 32);
+                if (lane < offset &&
+                    (other > maximum ||
+                     (other == maximum && other_index < maximum_index))) {
+                    maximum = other;
+                    maximum_index = other_index;
+                }
+            }
+            if (lane == 0) {
+                current_k[0] = maximum;
+                winner_indices[0] = maximum_index;
+            }
+        }
+        __syncthreads();
+        block_q8_K& block = args.q8_output[q_head];
+        if (current_k[0] == 0.0f) {
+            block.qs[dim] = 0;
+            if (dim < QK_K / 16) block.bsums[dim] = 0;
+            if (dim == 0) block.d = 0.0f;
+            return;
+        }
+        const float inverse_scale =
+            __fdiv_rn(-127.0f, q[winner_indices[0]]);
+        int quant = nearest_integer(__fmul_rn(inverse_scale, gated));
+        if (quant > 127) quant = 127;
+        block.qs[dim] = (int8_t)quant;
+        __syncthreads();
+        if (dim < QK_K / 16) {
+            int sum = 0;
+#pragma unroll
+            for (int index = 0; index < 16; index++)
+                sum += block.qs[dim * 16 + index];
+            block.bsums[dim] = (int16_t)sum;
+        }
+        if (dim == 0) block.d = __fdiv_rn(1.0f, inverse_scale);
+    }
 }
 
 bool hip_result(hipError_t result, const char* operation, std::string* error) {

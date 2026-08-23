@@ -59,6 +59,13 @@ public:
     bool reset_state(std::string* error = nullptr);
     bool forward(int32_t token, int32_t position, std::vector<float>* logits,
                  std::string* error = nullptr);
+    // Benchmark path matching llama-bench: execute and synchronize a decode
+    // step without transferring logits or sampling on the host.
+    bool forward_no_logits(int32_t token, int32_t position,
+                           std::string* error = nullptr);
+    bool set_benchmark_depth(int depth, std::string* error = nullptr);
+    bool benchmark_fixed_depth(int32_t token, int depth, int iterations,
+                               std::string* error = nullptr);
 
     bool loaded() const;
     int n_past() const;

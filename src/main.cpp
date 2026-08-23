@@ -11,12 +11,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <climits>
+#include <cmath>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
 using namespace ns;
+
+#ifndef NS_BUILD_COMMIT
+#define NS_BUILD_COMMIT "unknown"
+#endif
 
 static const double GB = 1e9;
 static const double GiB = 1024.0 * 1024.0 * 1024.0;
@@ -52,6 +58,12 @@ static int usage() {
             "           [--no-graph] [--profile]\n"
             "  runs the eager gfx1201 decode engine. Integer Q8_K GEMV is the\n"
             "  default; --fp32-gemv selects the dequant-and-FMA diagnostic path.\n");
+    fprintf(stderr,
+            "\n"
+            "       ns bench <model.gguf> [--tokens 512] [--depth N] [--reps 3]\n"
+            "                              [--warmup 8] [--jsonl FILE]\n"
+            "  runs the graph decode benchmark without logits transfer or sampling,\n"
+            "  matching llama-bench tg timing and emitting compatible JSONL.\n");
     return 2;
 }
 
@@ -227,7 +239,7 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
             return 1;
         }
         if (!all_pos && index + 1 != tokens.size()) {
-            printf("  pos %3zu token %6d  %.3f s\n", index, tokens[index], elapsed);
+            printf("  pos %3zu token %6d  %.6f s\n", index, tokens[index], elapsed);
             continue;
         }
         std::vector<int> order(logits.size());
@@ -240,7 +252,7 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
         double sum = 0.0;
         const float maximum = logits[order[0]];
         for (float value : logits) sum += exp((double)(value - maximum));
-        printf("  pos %3zu token %6d  %.3f s  top%d:", index, tokens[index],
+        printf("  pos %3zu token %6d  %.6f s  top%d:", index, tokens[index],
                elapsed, count);
         for (int item = 0; item < count; item++)
             printf(" [%d]=%.4f(p=%.3f)", order[item], logits[order[item]],
@@ -296,6 +308,111 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
         }
         printf("%-24s %7s %10s %10.2f\n", "PROFILED KERNEL TOTAL", "-", "-",
                profiled_total);
+    }
+    return 0;
+}
+
+static int cmd_bench(const std::string& path, int tokens, int depth, int reps,
+                     int warmup, const std::string& jsonl_path,
+                     bool allow_display) {
+    GpuEngineOptions options;
+    options.max_context = depth + warmup + tokens + 1;
+    options.allow_display = allow_display;
+    options.integer_gemv = true;
+    options.use_graph = true;
+    GpuEngine engine;
+    std::string error;
+    const double load_start = now_sec();
+    if (!engine.load(path, options, &error)) {
+        fprintf(stderr, "ns bench: GPU load failed: %s\n", error.c_str());
+        return 1;
+    }
+    printf("bench loaded %s on %s (%s), PCI %s in %.2f s; tg%d depth %d, "
+           "%d reps, %d warmup\n",
+           engine.config().name.c_str(), engine.weight_stats().device_name.c_str(),
+           engine.weight_stats().device_arch.c_str(),
+           engine.weight_stats().device_pci.c_str(), now_sec() - load_start,
+           tokens, depth, reps, warmup);
+    std::vector<double> samples_ns((size_t)reps);
+    std::vector<double> samples_ts((size_t)reps);
+    for (int repeat = 0; repeat < reps; repeat++) {
+        if (!engine.set_benchmark_depth(depth, &error)) {
+            fprintf(stderr, "ns bench: reset depth %d: %s\n", depth,
+                    error.c_str());
+            return 1;
+        }
+        if (warmup > 0 &&
+            !engine.benchmark_fixed_depth(760, depth, warmup, &error)) {
+            fprintf(stderr, "ns bench: warmup: %s\n", error.c_str());
+            return 1;
+        }
+        if (!engine.set_benchmark_depth(depth, &error)) {
+            fprintf(stderr, "ns bench: measured reset depth %d: %s\n", depth,
+                    error.c_str());
+            return 1;
+        }
+        const double start = now_sec();
+        if (!engine.benchmark_fixed_depth(760, depth, tokens, &error)) {
+            fprintf(stderr, "ns bench: repeat %d: %s\n", repeat,
+                    error.c_str());
+            return 1;
+        }
+        const double elapsed = now_sec() - start;
+        samples_ns[(size_t)repeat] = elapsed * 1.0e9;
+        samples_ts[(size_t)repeat] = tokens / elapsed;
+        printf("  run %d: %.6f s, %.3f t/s\n", repeat + 1, elapsed,
+               samples_ts[(size_t)repeat]);
+    }
+    double mean_ns = 0.0;
+    double mean_ts = 0.0;
+    for (int repeat = 0; repeat < reps; repeat++) {
+        mean_ns += samples_ns[(size_t)repeat];
+        mean_ts += samples_ts[(size_t)repeat];
+    }
+    mean_ns /= reps;
+    mean_ts /= reps;
+    double variance_ns = 0.0;
+    double variance_ts = 0.0;
+    for (int repeat = 0; repeat < reps; repeat++) {
+        variance_ns += (samples_ns[(size_t)repeat] - mean_ns) *
+                       (samples_ns[(size_t)repeat] - mean_ns);
+        variance_ts += (samples_ts[(size_t)repeat] - mean_ts) *
+                       (samples_ts[(size_t)repeat] - mean_ts);
+    }
+    const double sd_ns = sqrt(variance_ns / reps);
+    const double sd_ts = sqrt(variance_ts / reps);
+    printf("RESULT tg%d depth %d: %.3f +/- %.3f t/s (%.3f ms/token)\n",
+           tokens, depth, mean_ts, sd_ts, 1000.0 / mean_ts);
+
+    if (!jsonl_path.empty()) {
+        FILE* output = fopen(jsonl_path.c_str(), "a");
+        if (!output) {
+            fprintf(stderr, "ns bench: cannot append %s\n", jsonl_path.c_str());
+            return 1;
+        }
+        fprintf(output,
+                "{\"build_commit\":\"%s\",\"build_number\":0,"
+                "\"backends\":\"HIP\","
+                "\"model_filename\":\"%s\",\"model_type\":\"%s\","
+                "\"model_size\":%zu,\"n_prompt\":0,\"n_gen\":%d,"
+                "\"n_depth\":%d,\"n_batch\":1,\"n_ubatch\":1,"
+                "\"n_threads\":0,\"n_gpu_layers\":99,\"type_k\":\"f16\","
+                "\"type_v\":\"f16\",\"flash_attn\":1,"
+                "\"avg_ns\":%.0f,\"stddev_ns\":%.0f,"
+                "\"avg_ts\":%.6f,\"stddev_ts\":%.6f,\"samples_ns\":[",
+                NS_BUILD_COMMIT, path.c_str(), engine.config().name.c_str(),
+                engine.weight_stats().arena_bytes, tokens, depth, mean_ns, sd_ns,
+                mean_ts, sd_ts);
+        for (int repeat = 0; repeat < reps; repeat++)
+            fprintf(output, "%s%.0f", repeat ? "," : "",
+                    samples_ns[(size_t)repeat]);
+        fprintf(output, "],\"samples_ts\":[");
+        for (int repeat = 0; repeat < reps; repeat++)
+            fprintf(output, "%s%.6f", repeat ? "," : "",
+                    samples_ts[(size_t)repeat]);
+        fprintf(output, "]}\n");
+        fclose(output);
+        printf("JSONL appended to %s\n", jsonl_path.c_str());
     }
     return 0;
 }
@@ -490,6 +607,37 @@ int main(int argc, char** argv) {
         return cmd_gpu_eval(argv[2], tokens, topk, all_pos, dump, generate,
                             token_dump, context, fp32_gemv, allow_display,
                             no_graph, profile);
+    }
+    if (cmd == "bench") {
+        if (argc < 3) return usage();
+        int tokens = 512;
+        int depth = 0;
+        int reps = 3;
+        int warmup = 8;
+        std::string jsonl;
+        bool allow_display = false;
+        for (int index = 3; index < argc; index++) {
+            const std::string argument = argv[index];
+            if (argument == "--tokens" && index + 1 < argc)
+                tokens = atoi(argv[++index]);
+            else if (argument == "--depth" && index + 1 < argc)
+                depth = atoi(argv[++index]);
+            else if (argument == "--reps" && index + 1 < argc)
+                reps = atoi(argv[++index]);
+            else if (argument == "--warmup" && index + 1 < argc)
+                warmup = atoi(argv[++index]);
+            else if (argument == "--jsonl" && index + 1 < argc)
+                jsonl = argv[++index];
+            else if (argument == "--allow-display")
+                allow_display = true;
+            else
+                return usage();
+        }
+        if (tokens <= 0 || depth < 0 || reps <= 0 || warmup < 0 ||
+            depth > INT_MAX - warmup - tokens - 1)
+            return usage();
+        return cmd_bench(argv[2], tokens, depth, reps, warmup, jsonl,
+                         allow_display);
     }
     if (cmd == "inspect") {
         if (argc < 3) return usage();

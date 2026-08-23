@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <new>
@@ -174,6 +175,7 @@ struct GpuEngine::Impl {
     bool conv_bank_b = false;
     bool poisoned = false;
     int32_t* host_step_control = nullptr;
+    float* host_logits_staging = nullptr;
     hipGraphExec_t graph_exec[2] = {nullptr, nullptr};
     std::vector<PendingProfile> pending_profile;
     std::vector<GpuProfileEntry> last_profile;
@@ -194,6 +196,11 @@ struct GpuEngine::Impl {
             (void)ignored;
         }
         host_step_control = nullptr;
+        if (host_logits_staging) {
+            const hipError_t ignored = hipHostFree(host_logits_staging);
+            (void)ignored;
+        }
+        host_logits_staging = nullptr;
         if (runtime_arena) {
             const hipError_t ignored = hipFree(runtime_arena);
             (void)ignored;
@@ -291,6 +298,17 @@ struct GpuEngine::Impl {
                 NEED(ssm_conv1d, "ssm_conv1d.weight");
                 NEED(ssm_norm, "ssm_norm.weight");
                 NEED(ssm_out, "ssm_out.weight");
+                if (item.ssm_alpha->type != NS_Q8_0 ||
+                    item.ssm_beta->type != NS_Q8_0 ||
+                    item.ssm_alpha->ne[0] != config.n_embd ||
+                    item.ssm_beta->ne[0] != config.n_embd ||
+                    item.ssm_alpha->ne[1] != config.ssm_time_step_rank ||
+                    item.ssm_beta->ne[1] != config.ssm_time_step_rank) {
+                    if (error)
+                        *error = base +
+                                 "ssm_alpha/beta must be Q8_0 [48,5120]";
+                    return false;
+                }
                 if (!require_f32(item.ssm_a, error) ||
                     !require_f32(item.ssm_dt_bias, error) ||
                     !require_f32(item.ssm_conv1d, error) ||
@@ -413,6 +431,11 @@ struct GpuEngine::Impl {
             !hip_result(hipHostMalloc(reinterpret_cast<void**>(&host_step_control),
                                       3 * sizeof(int32_t), hipHostMallocDefault),
                         "hipHostMalloc(step control)", error)) return false;
+        if (!hip_result(hipHostMalloc(
+                           reinterpret_cast<void**>(&host_logits_staging),
+                           (size_t)config.n_vocab * sizeof(float),
+                           hipHostMallocDefault),
+                        "hipHostMalloc(logits staging)", error)) return false;
         return reset_state(error);
     }
 
@@ -461,12 +484,56 @@ struct GpuEngine::Impl {
             gpu_quantize_q8_K(input, buffers.q8, elements, weights.stream(), error);
     }
 
+    bool normalize(const float* input, const float* weight, float* normalized,
+                   int elements, std::string* error) {
+        if (options.integer_gemv)
+            return gpu_rms_norm_quantize_q8_K(
+                input, weight, normalized, buffers.q8, elements,
+                weights.config().rms_eps, weights.stream(), error);
+        return gpu_rms_norm(input, weight, normalized, elements,
+                            weights.config().rms_eps, weights.stream(), error);
+    }
+
+    bool activate_ffn(std::string* error) {
+        if (options.integer_gemv)
+            return gpu_silu_multiply_quantize_q8_K(
+                buffers.ffn_gate, buffers.ffn_up, buffers.ffn_activated,
+                buffers.q8, weights.config().n_ff, weights.stream(), error);
+        return gpu_silu_multiply(buffers.ffn_gate, buffers.ffn_up,
+                                 buffers.ffn_activated, weights.config().n_ff,
+                                 weights.stream(), error);
+    }
+
     bool gemv(const GpuTensor* tensor, const float* input, float* result,
               std::string* error) {
         if (options.integer_gemv && has_vec_dot_q8_K(tensor->type))
             return gpu_gemv_q8_K(*tensor, buffers.q8, result,
                                  weights.stream(), error);
         return gpu_gemv_f32(*tensor, input, result, weights.stream(), error);
+    }
+
+    bool gemv_add(const GpuTensor* tensor, const float* input,
+                  float* destination, std::string* error) {
+        if (options.integer_gemv && has_vec_dot_q8_K(tensor->type))
+            return gpu_gemv_q8_K_add(*tensor, buffers.q8, destination,
+                                     weights.stream(), error);
+        return gpu_gemv_f32_add(*tensor, input, destination, weights.stream(),
+                                error);
+    }
+
+    bool gemv_pair(const GpuTensor* first, const GpuTensor* second,
+                   const float* input, float* first_output,
+                   float* second_output, std::string* error) {
+        if (options.integer_gemv &&
+            gpu_gemv_q8_K_pair_supported(*first, *second))
+            return gpu_gemv_q8_K_pair(*first, *second, buffers.q8, first_output,
+                                      second_output, weights.stream(), error);
+        if (first->type == NS_Q8_0 && second->type == NS_Q8_0 &&
+            first->ne[0] == second->ne[0] && first->ne[1] == second->ne[1])
+            return gpu_gemv_f32_pair(*first, *second, input, first_output,
+                                     second_output, weights.stream(), error);
+        return gemv(first, input, first_output, error) &&
+               gemv(second, input, second_output, error);
     }
 
     bool profile_begin(const char* name, size_t* record_index,
@@ -564,17 +631,38 @@ struct GpuEngine::Impl {
             const GpuLayerWeights& item = layers[layer];
             if (!profile_begin(item.is_attention ? "A1 norm+qkv" : "K1 norm+projections",
                                &profile_record, error)) return false;
-            if (!gpu_rms_norm(buffers.hidden, f32_data(item.attn_norm),
-                              buffers.normalized, config.n_embd, config.rms_eps,
-                              stream, error))
-                return set_layer_error(layer, "attention RMSNorm", error);
-            if (!quantize(buffers.normalized, config.n_embd, error))
-                return set_layer_error(layer, "attention activation quantize", error);
+            if (!normalize(buffers.hidden, f32_data(item.attn_norm),
+                           buffers.normalized, config.n_embd, error))
+                return set_layer_error(layer, "attention norm/quantize", error);
 
             if (item.is_attention) {
-                if (!gemv(item.attn_q, buffers.normalized, buffers.qg, error) ||
-                    !gemv(item.attn_k, buffers.normalized, buffers.key, error) ||
-                    !gemv(item.attn_v, buffers.normalized, buffers.value, error))
+                bool projected = false;
+                if (item.attn_q->type == item.attn_k->type)
+                    projected = gemv_pair(item.attn_q, item.attn_k,
+                                          buffers.normalized, buffers.qg,
+                                          buffers.key, error) &&
+                                gemv(item.attn_v, buffers.normalized,
+                                     buffers.value, error);
+                else if (item.attn_q->type == item.attn_v->type)
+                    projected = gemv_pair(item.attn_q, item.attn_v,
+                                          buffers.normalized, buffers.qg,
+                                          buffers.value, error) &&
+                                gemv(item.attn_k, buffers.normalized,
+                                     buffers.key, error);
+                else if (item.attn_k->type == item.attn_v->type)
+                    projected = gemv(item.attn_q, buffers.normalized,
+                                     buffers.qg, error) &&
+                                gemv_pair(item.attn_k, item.attn_v,
+                                          buffers.normalized, buffers.key,
+                                          buffers.value, error);
+                else
+                    projected = gemv(item.attn_q, buffers.normalized,
+                                     buffers.qg, error) &&
+                                gemv(item.attn_k, buffers.normalized,
+                                     buffers.key, error) &&
+                                gemv(item.attn_v, buffers.normalized,
+                                     buffers.value, error);
+                if (!projected)
                     return set_layer_error(layer, "attention projections", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "A1 profile", error);
@@ -589,6 +677,7 @@ struct GpuEngine::Impl {
                 args.k_cache = buffers.k_cache + cache_offset;
                 args.v_cache = buffers.v_cache + cache_offset;
                 args.gated_output = buffers.gated;
+                args.q8_output = options.integer_gemv ? buffers.q8 : nullptr;
                 args.step_control = device_control;
                 args.n_past = past_value;
                 args.capacity = options.max_context;
@@ -601,21 +690,17 @@ struct GpuEngine::Impl {
                     return set_layer_error(layer, "A2 profile", error);
                 if (!profile_begin("A3 output+residual", &profile_record, error))
                     return set_layer_error(layer, "A3 profile", error);
-                if (!quantize(buffers.gated, config.attn_o_dim(), error) ||
-                    !gemv(item.attn_out, buffers.gated, buffers.residual, error) ||
-                    !gpu_add_in_place(buffers.hidden, buffers.residual,
-                                      config.n_embd, stream, error))
+                if (!gemv_add(item.attn_out, buffers.gated, buffers.hidden, error))
                     return set_layer_error(layer, "attention output", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "A3 profile", error);
             } else {
-                if (!gemv(item.attn_qkv, buffers.normalized, buffers.gdn_mixed,
-                          error) ||
-                    !gemv(item.attn_gate, buffers.normalized, buffers.gdn_z,
-                          error) ||
-                    !gemv(item.ssm_alpha, buffers.normalized, buffers.alpha,
-                          error) ||
-                    !gemv(item.ssm_beta, buffers.normalized, buffers.beta, error))
+                if (!gemv_pair(item.attn_qkv, item.attn_gate,
+                               buffers.normalized, buffers.gdn_mixed,
+                               buffers.gdn_z, error) ||
+                    !gpu_gemv_f32_pair(*item.ssm_alpha, *item.ssm_beta,
+                                       buffers.normalized, buffers.alpha,
+                                       buffers.beta, stream, error))
                     return set_layer_error(layer, "GDN projections", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "K1 profile", error);
@@ -646,9 +731,7 @@ struct GpuEngine::Impl {
                 if (!profile_begin("K3 output+residual", &profile_record, error))
                     return set_layer_error(layer, "K3 profile", error);
                 if (!quantize(buffers.gated, config.ssm_inner_size, error) ||
-                    !gemv(item.ssm_out, buffers.gated, buffers.residual, error) ||
-                    !gpu_add_in_place(buffers.hidden, buffers.residual,
-                                      config.n_embd, stream, error))
+                    !gemv_add(item.ssm_out, buffers.gated, buffers.hidden, error))
                     return set_layer_error(layer, "GDN output", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "K3 profile", error);
@@ -657,16 +740,12 @@ struct GpuEngine::Impl {
             if (!profile_begin(item.is_attention ? "A4 FFN up+gate" : "K4 FFN up+gate",
                                &profile_record, error))
                 return set_layer_error(layer, "FFN stage 4 profile", error);
-            if (!gpu_rms_norm(buffers.hidden, f32_data(item.post_attn_norm),
-                              buffers.normalized, config.n_embd, config.rms_eps,
-                              stream, error) ||
-                !quantize(buffers.normalized, config.n_embd, error))
-                return set_layer_error(layer, "FFN RMSNorm", error);
-            if (!gemv(item.ffn_gate, buffers.normalized, buffers.ffn_gate, error) ||
-                !gemv(item.ffn_up, buffers.normalized, buffers.ffn_up, error) ||
-                !gpu_silu_multiply(buffers.ffn_gate, buffers.ffn_up,
-                                   buffers.ffn_activated, config.n_ff, stream,
-                                   error))
+            if (!normalize(buffers.hidden, f32_data(item.post_attn_norm),
+                           buffers.normalized, config.n_embd, error))
+                return set_layer_error(layer, "FFN norm/quantize", error);
+            if (!gemv_pair(item.ffn_gate, item.ffn_up, buffers.normalized,
+                           buffers.ffn_gate, buffers.ffn_up, error) ||
+                !activate_ffn(error))
                 return set_layer_error(layer, "FFN up/gate", error);
             if (!profile_end(profile_record, error))
                 return set_layer_error(layer, "FFN stage 4 profile", error);
@@ -674,21 +753,16 @@ struct GpuEngine::Impl {
                                                  : "K5 FFN down+residual",
                                &profile_record, error))
                 return set_layer_error(layer, "FFN stage 5 profile", error);
-            if (!quantize(buffers.ffn_activated, config.n_ff, error) ||
-                !gemv(item.ffn_down, buffers.ffn_activated, buffers.residual,
-                      error) ||
-                !gpu_add_in_place(buffers.hidden, buffers.residual, config.n_embd,
-                                  stream, error))
+            if (!gemv_add(item.ffn_down, buffers.ffn_activated, buffers.hidden,
+                          error))
                 return set_layer_error(layer, "FFN", error);
             if (!profile_end(profile_record, error))
                 return set_layer_error(layer, "FFN stage 5 profile", error);
         }
 
         if (!profile_begin("H1 final norm", &profile_record, error)) return false;
-        if (!gpu_rms_norm(buffers.hidden, f32_data(output_norm),
-                          buffers.normalized, config.n_embd, config.rms_eps,
-                          stream, error) ||
-            !quantize(buffers.normalized, config.n_embd, error) ||
+        if (!normalize(buffers.hidden, f32_data(output_norm), buffers.normalized,
+                       config.n_embd, error) ||
             !profile_end(profile_record, error) ||
             !profile_begin("H2 lm_head", &profile_record, error) ||
             !gemv(output, buffers.normalized, buffers.logits, error) ||
@@ -770,8 +844,8 @@ struct GpuEngine::Impl {
 
     bool forward(int32_t token, int32_t position, std::vector<float>* host_logits,
                  std::string* error) {
-        if (!runtime_arena || !host_logits) {
-            if (error) *error = "GPU engine is not loaded or logits output is null";
+        if (!runtime_arena) {
+            if (error) *error = "GPU engine is not loaded";
             return false;
         }
         if (poisoned) {
@@ -808,16 +882,24 @@ struct GpuEngine::Impl {
                 return false;
             }
         }
-        host_logits->resize(config.n_vocab);
-        if (!hip_result(hipMemcpyAsync(host_logits->data(), buffers.logits,
-                                       host_logits->size() * sizeof(float),
-                                       hipMemcpyDeviceToHost, stream),
-                        "copy logits to host", error) ||
-            !hip_result(hipStreamSynchronize(stream), "synchronize decode step",
+        if (host_logits) {
+            host_logits->resize(config.n_vocab);
+            if (!hip_result(hipMemcpyAsync(host_logits_staging, buffers.logits,
+                                           host_logits->size() * sizeof(float),
+                                           hipMemcpyDeviceToHost, stream),
+                            "copy logits to host", error)) {
+                poisoned = true;
+                return false;
+            }
+        }
+        if (!hip_result(hipStreamSynchronize(stream), "synchronize decode step",
                         error)) {
             poisoned = true;
             return false;
         }
+        if (host_logits)
+            memcpy(host_logits->data(), host_logits_staging,
+                   host_logits->size() * sizeof(float));
         if (!finalize_profile(error)) {
             poisoned = true;
             return false;
@@ -866,6 +948,66 @@ bool GpuEngine::forward(int32_t token, int32_t position,
                         std::vector<float>* logits, std::string* error) {
     if (error) error->clear();
     return impl_->forward(token, position, logits, error);
+}
+
+bool GpuEngine::forward_no_logits(int32_t token, int32_t position,
+                                  std::string* error) {
+    if (error) error->clear();
+    return impl_->forward(token, position, nullptr, error);
+}
+
+bool GpuEngine::set_benchmark_depth(int depth, std::string* error) {
+    if (error) error->clear();
+    if (!impl_->runtime_arena || depth < 0 || depth >= impl_->options.max_context) {
+        if (error) *error = "benchmark depth is outside the loaded context";
+        return false;
+    }
+    if (!impl_->reset_state(error)) return false;
+    impl_->past = depth;
+    impl_->conv_bank_b = (depth & 1) != 0;
+    return true;
+}
+
+bool GpuEngine::benchmark_fixed_depth(int32_t token, int depth, int iterations,
+                                      std::string* error) {
+    if (error) error->clear();
+    if (!impl_->runtime_arena || !impl_->options.use_graph ||
+        impl_->options.profile || token < 0 ||
+        (uint32_t)token >= impl_->weights.config().n_vocab || depth < 0 ||
+        depth >= impl_->options.max_context || iterations <= 0) {
+        if (error) *error = "invalid fixed-depth graph benchmark arguments";
+        return false;
+    }
+    if (!impl_->capture_graphs(error)) return false;
+    const hipStream_t stream = impl_->weights.stream();
+    if (!hip_result(hipStreamSynchronize(stream),
+                    "synchronize before fixed-depth benchmark", error))
+        return false;
+    // Keep the pinned source immutable until every queued graph has consumed
+    // it. Fixed n_past is the benchmark's requested depth; alternating graph
+    // parity still advances the race-free convolution ping-pong state.
+    impl_->host_step_control[0] = token;
+    impl_->host_step_control[1] = depth;
+    impl_->host_step_control[2] = depth;
+    for (int index = 0; index < iterations; index++) {
+        if (!hip_result(
+                hipGraphLaunch(impl_->graph_exec[(depth + index) & 1], stream),
+                "launch fixed-depth decode graph", error)) {
+            impl_->poisoned = true;
+            return false;
+        }
+        // ROCm's userspace graph submission queue becomes CPU-bound and can
+        // stall for minutes when hundreds of large graphs are queued at once.
+        // Sixteen retains launch overlap while bounding that driver backlog.
+        if ((index + 1) % 16 == 0 || index + 1 == iterations) {
+            if (!hip_result(hipStreamSynchronize(stream),
+                            "synchronize fixed-depth decode graphs", error)) {
+                impl_->poisoned = true;
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool GpuEngine::loaded() const { return impl_->runtime_arena != nullptr; }

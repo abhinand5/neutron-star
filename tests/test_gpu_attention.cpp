@@ -286,6 +286,7 @@ int main() {
     float* d_q_norm = device_allocate<float>(q_norm.size());
     float* d_k_norm = device_allocate<float>(k_norm.size());
     float* d_output = device_allocate<float>(actual.size());
+    block_q8_K* d_q8 = device_allocate<block_q8_K>(ATTENTION_Q_HEADS);
     uint16_t* d_k_cache = device_allocate<uint16_t>(cache_count);
     uint16_t* d_v_cache = device_allocate<uint16_t>(cache_count);
     hipStream_t stream = nullptr;
@@ -310,6 +311,7 @@ int main() {
     gpu_args.k_cache = d_k_cache;
     gpu_args.v_cache = d_v_cache;
     gpu_args.gated_output = d_output;
+    gpu_args.q8_output = d_q8;
     gpu_args.capacity = capacity;
     std::string error;
 
@@ -356,6 +358,10 @@ int main() {
         HIP_CHECK(hipMemcpyAsync(actual.data(), d_output,
                                  actual.size() * sizeof(float), hipMemcpyDeviceToHost,
                                  stream));
+        std::vector<block_q8_K> q8_gpu(ATTENTION_Q_HEADS);
+        HIP_CHECK(hipMemcpyAsync(q8_gpu.data(), d_q8,
+                                 q8_gpu.size() * sizeof(block_q8_K),
+                                 hipMemcpyDeviceToHost, stream));
         HIP_CHECK(hipMemcpyAsync(k_cache_gpu.data(), d_k_cache,
                                  cache_count * sizeof(uint16_t),
                                  hipMemcpyDeviceToHost, stream));
@@ -363,6 +369,10 @@ int main() {
                                  cache_count * sizeof(uint16_t),
                                  hipMemcpyDeviceToHost, stream));
         HIP_CHECK(hipStreamSynchronize(stream));
+        std::vector<block_q8_K> q8_cpu(ATTENTION_Q_HEADS);
+        quantize_row_q8_K(actual.data(), q8_cpu.data(), actual.size());
+        CHECK(memcmp(q8_gpu.data(), q8_cpu.data(),
+                     q8_cpu.size() * sizeof(block_q8_K)) == 0);
         worst_output = std::max(worst_output, compare_output(expected, actual));
         worst_k_cache = std::max(
             worst_k_cache,
@@ -382,6 +392,7 @@ int main() {
     ignored = hipFree(d_v_cache);
     ignored = hipFree(d_k_cache);
     ignored = hipFree(d_output);
+    ignored = hipFree(d_q8);
     ignored = hipFree(d_k_norm);
     ignored = hipFree(d_q_norm);
     ignored = hipFree(d_v);

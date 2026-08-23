@@ -18,15 +18,42 @@ bool gpu_prepare_gemv(std::string* error = nullptr);
 // No allocation or synchronization occurs; work is enqueued on `stream`.
 bool gpu_gemv_f32(const GpuTensor& tensor, const float* input, float* output,
                   hipStream_t stream, std::string* error = nullptr);
+bool gpu_gemv_f32_add(const GpuTensor& tensor, const float* input,
+                      float* destination, hipStream_t stream,
+                      std::string* error = nullptr);
+bool gpu_gemv_f32_pair(const GpuTensor& first, const GpuTensor& second,
+                       const float* input, float* first_output,
+                       float* second_output, hipStream_t stream,
+                       std::string* error = nullptr);
 
 size_t gpu_q8_K_bytes(int64_t elements);
 bool gpu_quantize_q8_K(const float* input, block_q8_K* output, int64_t elements,
                        hipStream_t stream, std::string* error = nullptr);
+bool gpu_rms_norm_quantize_q8_K(const float* input, const float* weight,
+                                float* normalized, block_q8_K* output,
+                                int64_t elements, float epsilon,
+                                hipStream_t stream,
+                                std::string* error = nullptr);
+bool gpu_silu_multiply_quantize_q8_K(const float* gate, const float* up,
+                                     float* activated, block_q8_K* output,
+                                     int64_t elements, hipStream_t stream,
+                                     std::string* error = nullptr);
 
 // Integer-dot path used by the shipping K-quant GEMVs. The activation must have
 // been produced by gpu_quantize_q8_K for tensor.ne[0] elements.
 bool gpu_gemv_q8_K(const GpuTensor& tensor, const block_q8_K* input, float* output,
                    hipStream_t stream, std::string* error = nullptr);
+// Combines two same-type, same-input-width matrices into one dispatch. Row
+// counts may differ; each matrix retains the exact standalone K-split order.
+bool gpu_gemv_q8_K_pair(const GpuTensor& first, const GpuTensor& second,
+                        const block_q8_K* input, float* first_output,
+                        float* second_output, hipStream_t stream,
+                        std::string* error = nullptr);
+bool gpu_gemv_q8_K_pair_supported(const GpuTensor& first,
+                                  const GpuTensor& second);
+bool gpu_gemv_q8_K_add(const GpuTensor& tensor, const block_q8_K* input,
+                       float* destination, hipStream_t stream,
+                       std::string* error = nullptr);
 
 // Dequantizes one output row of a repacked matrix. This is the token-embedding
 // gather path; unlike GEMV it touches only the selected row's exact GGUF bits.

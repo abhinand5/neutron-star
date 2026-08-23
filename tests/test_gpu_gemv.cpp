@@ -106,6 +106,7 @@ static void cpu_integer_matvec(const GgufTensor& tensor, const block_q8_K* input
 struct DeviceBuffers {
     float* input = nullptr;
     float* output = nullptr;
+    float* second_output = nullptr;
     block_q8_K* q8 = nullptr;
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
@@ -113,6 +114,8 @@ struct DeviceBuffers {
     DeviceBuffers(size_t input_count, size_t output_count) {
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&input), input_count * sizeof(float)));
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&output), output_count * sizeof(float)));
+        HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&second_output),
+                            output_count * sizeof(float)));
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&q8), gpu_q8_K_bytes((int64_t)input_count)));
         HIP_CHECK(hipEventCreate(&start));
         HIP_CHECK(hipEventCreate(&stop));
@@ -121,6 +124,7 @@ struct DeviceBuffers {
         hipError_t ignored = hipEventDestroy(start);
         ignored = hipEventDestroy(stop);
         ignored = hipFree(q8);
+        ignored = hipFree(second_output);
         ignored = hipFree(output);
         ignored = hipFree(input);
         (void)ignored;
@@ -154,6 +158,7 @@ static size_t test_model(const std::string& path, std::set<Shape>* covered,
     std::vector<float> activation((size_t)max_k);
     std::vector<float> cpu_output((size_t)max_rows);
     std::vector<float> gpu_output((size_t)max_rows);
+    std::vector<float> add_baseline((size_t)max_rows);
     size_t tested_bytes = 0;
 
     const GgufTensor* embedding_source = file.tensor("token_embd.weight");
@@ -239,6 +244,21 @@ static size_t test_model(const std::string& path, std::set<Shape>* covered,
                     max_abs, max_normalized);
         }
         CHECK(failures == 0);
+        const std::vector<float> gpu_f32_baseline = gpu_output;
+        for (int64_t row = 0; row < source.ne[1]; row++)
+            add_baseline[(size_t)row] = 0.125f * sinf((float)row * 0.013f);
+        HIP_CHECK(hipMemcpyAsync(device.output, add_baseline.data(),
+                                 (size_t)source.ne[1] * sizeof(float),
+                                 hipMemcpyHostToDevice, weights.stream()));
+        CHECK(gpu_gemv_f32_add(*target, device.input, device.output,
+                               weights.stream(), &error));
+        HIP_CHECK(hipMemcpyAsync(gpu_output.data(), device.output,
+                                 (size_t)source.ne[1] * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipStreamSynchronize(weights.stream()));
+        for (int64_t row = 0; row < source.ne[1]; row++)
+            CHECK(gpu_output[(size_t)row] ==
+                  gpu_f32_baseline[(size_t)row] + add_baseline[(size_t)row]);
         printf("    %-7s %6" PRId64 "x%-5" PRId64 " %-34s "
                "fp32 max %.3g  cpu %.3f s  gpu %.3f ms",
                type_info(source.type).name, source.ne[1], source.ne[0],
@@ -294,6 +314,28 @@ static size_t test_model(const std::string& path, std::set<Shape>* covered,
                 fprintf(stderr, "integer GEMV mismatch %s: %d rows exceed 2e-3, worst %.9g\n",
                         source.name.c_str(), failures, max_normalized);
             CHECK(failures == 0);
+            const std::vector<float> gpu_q8_baseline = gpu_output;
+            CHECK(gpu_gemv_q8_K_pair(*target, *target, device.q8,
+                                     device.output, device.second_output,
+                                     weights.stream(), &error));
+            HIP_CHECK(hipMemcpyAsync(gpu_output.data(), device.second_output,
+                                     (size_t)source.ne[1] * sizeof(float),
+                                     hipMemcpyDeviceToHost, weights.stream()));
+            HIP_CHECK(hipStreamSynchronize(weights.stream()));
+            for (int64_t row = 0; row < source.ne[1]; row++)
+                CHECK(gpu_output[(size_t)row] == gpu_q8_baseline[(size_t)row]);
+            HIP_CHECK(hipMemcpyAsync(device.output, add_baseline.data(),
+                                     (size_t)source.ne[1] * sizeof(float),
+                                     hipMemcpyHostToDevice, weights.stream()));
+            CHECK(gpu_gemv_q8_K_add(*target, device.q8, device.output,
+                                    weights.stream(), &error));
+            HIP_CHECK(hipMemcpyAsync(gpu_output.data(), device.output,
+                                     (size_t)source.ne[1] * sizeof(float),
+                                     hipMemcpyDeviceToHost, weights.stream()));
+            HIP_CHECK(hipStreamSynchronize(weights.stream()));
+            for (int64_t row = 0; row < source.ne[1]; row++)
+                CHECK(gpu_output[(size_t)row] ==
+                      gpu_q8_baseline[(size_t)row] + add_baseline[(size_t)row]);
             printf("  q8 max %.3g gpu %.3f ms q8-byte-diff %zu",
                    max_normalized, gpu_ms, q8_byte_differences);
         }

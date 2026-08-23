@@ -1476,3 +1476,109 @@ HIP compilation used `--offload-arch=gfx1201` exactly.
 worklist: fuse norm/quant/projection setup and residual/FFN elementwise work, recover
 K2's isolated <=15 us behavior in-model, reduce the 1,141-node graph toward PLAN's
 ~325 dispatches, then run formal G2a/G2b on both GGUF files at depth 0 and 32,768.
+
+---
+
+## 2026-08-23 — Session 13 (Stage 2 task 7 checkpoint: Q4 G2b depth-0 GREEN, GPT-5.6 Sol)
+
+**Task 7 remains open because Q5_K_XL is below its G2b target.** This checkpoint
+lands the correctness-preserving fusion/dispatch work, an honest fixed-depth
+benchmark command, and the first green half of the depth-0 performance gate. It
+does not declare G2a or G2b complete.
+
+### 1. Decode fusion and graph reduction
+
+The integer decode path now fuses RMSNorm with byte-exact Q8_K activation
+quantization and fuses SiLU×up with the following Q8_K quantization. A2 writes its
+gated output and the exact Q8_K representation together, removing A3's quantizer.
+The Q8_K maximum selection uses a deterministic wave-level max/lowest-index tree;
+unit tests compare every output byte with the standalone CPU/GPU quantizer.
+
+Projection dispatches now pair compatible matrices without changing each matrix's
+standalone K-split accumulation order: same-type integer projections, selected
+low-register mixed Q4/Q5/IQ pairs, attention q/k/v where compatible, and the two
+Q8_0 alpha/beta projections. Output projections and FFN-down write their GEMV sum
+directly into the residual destination. Pinned host logits staging removes pageable
+D2H overhead on normal synchronous decode.
+
+The Q4 graph fell from **1,141 to 657 nodes per parity** (42.4%); Q5 has **677**.
+The following full recurrent Q4 checkpoint remains byte-identical to the task-6
+graph/eager result:
+
+```text
+31-position p1 fp32-logit SHA-256:
+0b9507a344459877cf89f2be367bc0976359c0092bf80eeb2819f665fe4776e9
+Q5 one-token top-1: 2614
+```
+
+### 2. Honest built-in benchmark and depth-0 results
+
+`ns bench` now performs graph decode without logits transfer or host sampling,
+warms each repeat, times 512 fixed-depth steps, bounds ROCm's userspace submission
+backlog to 16 graphs, reports three-run mean/SD, and writes JSONL understood by the
+existing plotter. The build embeds the actual git revision; JSON also records fp16
+KV and the relevant llama-bench-compatible fields. Raw local output is
+`bench/results/g2b-20260823.jsonl` (ignored by design; results are preserved here).
+
+Commands:
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl bench/results/g2b-20260823.jsonl
+
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl bench/results/g2b-20260823.jsonl
+```
+
+| model | run t/s | mean ± population SD | ms/token | G2b depth-0 |
+|---|---|---:|---:|---|
+| Q4_K_XL | 33.043, 33.040, 33.037 | **33.040 ± 0.002 t/s** | 30.266 | **GREEN** (target 33) |
+| Q5_K_XL | 28.689, 28.700, 28.697 | **28.695 ± 0.004 t/s** | 34.849 | **RED** (target 30) |
+
+The Q5 step streams **19.47 GB** without MTP, so this is an honest >1 GB working
+set. Its measured weight-only roofline is about 32.9 t/s at 640 GB/s; reaching 30
+requires recovering about **1.52 ms/token**, not changing model bits or numerics.
+
+### 3. Q5 localization and rejected experiments
+
+A warmed eager Q5 profile measured **35,965.85 us** total: K1 6,054.21 us, K2
+904.54, K3 2,474.48, K4 10,718.47, K5 5,471.97, A1 1,734.39, A2 172.20, A3
+792.21, A4 3,675.09, A5 1,812.99, H1 10.92, and H2 2,123.51. Honest isolated
+real-weight checks place the large Q5 GEMVs near 595–604 GB/s, Q6 near 576–614
+GB/s, and the Q8_0 head near 628 GB/s.
+
+Measured experiments rejected and rolled back: folding alpha/beta into K2 (exact,
+but +0.20 ms); unrestricted heterogeneous projection pairing (+0.14 ms); scalar
+projection folding into norm (+0.19 ms); alpha/beta row groups 8/16 (neutral or
+slower); `__expf` SiLU (not exact); Q5 auxiliary-cache/unroll alternatives; Q6
+K-split 4 at input width 5120; and an unbounded graph queue (host submission
+stall). Q6 no-unroll remains only for input widths 17408 and 6144, where the honest
+microbench showed a small repeatable win.
+
+### 4. Verification
+
+```bash
+git diff --check
+make -j4 test
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 1 --reps 1 --warmup 0 --depth 0 \
+  --jsonl /tmp/ns-bench-schema-20260823.jsonl
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. The
+GEMV test covers **4,464,225,280 bytes** across 42 real `(m,k,type)` cases and now
+checks paired/add fusion against the exact standalone GPU result. The benchmark
+smoke JSON parsed with every field consumed by the existing plotting harness. Every
+HIP compile line used `--offload-arch=gfx1201` exactly.
+
+**NEXT:** Continue task 7 on Q5's remaining 1.52 ms using detailed substage/kernel
+profiling and weight-kernel improvements; do not regress Q4's narrow green margin.
+Then complete the full Q5 oracle sweep, 256-token greedy G2a runs on both files,
+and formal depth-32768 G2b measurements before entering Stage 3.

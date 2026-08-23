@@ -20,6 +20,8 @@ else
 endif
 
 FLAGS := $(ARCH) $(OPT) $(WARN) -Isrc -Itests -fopenmp
+GIT_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+GIT_DIRTY  := $(shell git diff --quiet HEAD -- 2>/dev/null || printf -- -dirty)
 
 # ---- sources -----------------------------------------------------------------
 SRCS   := $(wildcard src/*.cpp) $(wildcard src/kernels/*.hip)
@@ -62,6 +64,14 @@ $(NS): $(OBJS)
 $(BUILDDIR)/%.o: %
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) -MMD -MP -c $< -o $@
+
+# Refresh build identity even when main.cpp itself is unchanged. Benchmark JSONL
+# must pin the executable's source revision (PLAN section 9.4).
+.PHONY: FORCE
+$(BUILDDIR)/src/main.cpp.o: src/main.cpp FORCE
+	@mkdir -p $(dir $@)
+	$(HIPCC) $(FLAGS) -DNS_BUILD_COMMIT=\"$(GIT_COMMIT)$(GIT_DIRTY)\" \
+		-MMD -MP -c $< -o $@
 
 # ---- benchmarks --------------------------------------------------------------
 $(BUILDDIR)/gemv_bench: bench/gemv_bench.hip $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))

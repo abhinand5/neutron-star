@@ -2,6 +2,7 @@
 // tests/test_gpu_ops.cpp — eager-forward activation primitives vs CPU literals.
 // ============================================================================
 #include "ops.h"
+#include "gemv.h"
 
 #include <hip/hip_runtime.h>
 
@@ -96,10 +97,16 @@ int main() {
     float* d_second = nullptr;
     float* d_weight = nullptr;
     float* d_output = nullptr;
+    float* d_fused = nullptr;
+    block_q8_K* d_q8_reference = nullptr;
+    block_q8_K* d_q8_fused = nullptr;
     HIP_CHECK(hipMalloc(&d_input, input.size() * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_second, second.size() * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_weight, weight.size() * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_output, actual.size() * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_fused, actual.size() * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_q8_reference, gpu_q8_K_bytes(ffn_count)));
+    HIP_CHECK(hipMalloc(&d_q8_fused, gpu_q8_K_bytes(ffn_count)));
     hipStream_t stream = nullptr;
     HIP_CHECK(hipStreamCreate(&stream));
     HIP_CHECK(hipMemcpyAsync(d_input, input.data(), input.size() * sizeof(float),
@@ -126,6 +133,22 @@ int main() {
     actual.resize(norm_count);
     expected.resize(norm_count);
     const double norm_error = compare("RMSNorm", expected, actual, 2.0e-6);
+    CHECK(gpu_quantize_q8_K(d_output, d_q8_reference, norm_count, stream, &error));
+    CHECK(gpu_rms_norm_quantize_q8_K(d_input, d_weight, d_fused, d_q8_fused,
+                                     norm_count, 1.0e-6f, stream, &error));
+    std::vector<float> fused_norm(norm_count);
+    const size_t norm_q8_bytes = gpu_q8_K_bytes(norm_count);
+    std::vector<uint8_t> q8_reference(norm_q8_bytes), q8_fused(norm_q8_bytes);
+    HIP_CHECK(hipMemcpyAsync(fused_norm.data(), d_fused,
+                             fused_norm.size() * sizeof(float),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(q8_reference.data(), d_q8_reference, norm_q8_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(q8_fused.data(), d_q8_fused, norm_q8_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    CHECK(fused_norm == actual);
+    CHECK(q8_fused == q8_reference);
 
     actual.resize(ffn_count);
     expected.resize(ffn_count);
@@ -143,10 +166,27 @@ int main() {
     for (int index = 0; index < ffn_count; index++)
         expected[index] = input[index] / (1.0f + expf(-input[index])) * second[index];
     CHECK(gpu_silu_multiply(d_input, d_second, d_output, ffn_count, stream, &error));
+    CHECK(gpu_quantize_q8_K(d_output, d_q8_reference, ffn_count, stream, &error));
+    CHECK(gpu_silu_multiply_quantize_q8_K(
+        d_input, d_second, d_fused, d_q8_fused, ffn_count, stream, &error));
     HIP_CHECK(hipMemcpyAsync(actual.data(), d_output, actual.size() * sizeof(float),
                              hipMemcpyDeviceToHost, stream));
     HIP_CHECK(hipStreamSynchronize(stream));
     const double silu_error = compare("SiLU multiply", expected, actual, 1.0e-6);
+    std::vector<float> fused_silu(ffn_count);
+    const size_t ffn_q8_bytes = gpu_q8_K_bytes(ffn_count);
+    q8_reference.resize(ffn_q8_bytes);
+    q8_fused.resize(ffn_q8_bytes);
+    HIP_CHECK(hipMemcpyAsync(fused_silu.data(), d_fused,
+                             fused_silu.size() * sizeof(float),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(q8_reference.data(), d_q8_reference, ffn_q8_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(q8_fused.data(), d_q8_fused, ffn_q8_bytes,
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    CHECK(fused_silu == actual);
+    CHECK(q8_fused == q8_reference);
 
     CHECK(!gpu_rms_norm(nullptr, d_weight, d_output, norm_count, 1.0e-6f,
                         stream, &error));
@@ -156,6 +196,9 @@ int main() {
     printf("  GREEN — RMSNorm max %.3g, add max %.3g, SiLU-mul max %.3g; "
            "%d checks\n", norm_error, add_error, silu_error, g_checks);
     hipError_t ignored = hipStreamDestroy(stream);
+    ignored = hipFree(d_q8_fused);
+    ignored = hipFree(d_q8_reference);
+    ignored = hipFree(d_fused);
     ignored = hipFree(d_output);
     ignored = hipFree(d_weight);
     ignored = hipFree(d_second);
