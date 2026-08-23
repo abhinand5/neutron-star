@@ -33,6 +33,7 @@ struct AttentionStepArgs {
     uint16_t* k_cache = nullptr;     // fp16 [capacity][4][256]
     uint16_t* v_cache = nullptr;     // fp16 [capacity][4][256]
     float* gated_output = nullptr;   // [24][256]
+    const int32_t* step_control = nullptr; // optional [token, position, n_past]
     int n_past = 0;
     int capacity = 0;
     int position = 0;

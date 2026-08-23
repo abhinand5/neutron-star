@@ -1346,3 +1346,133 @@ HIP compile line used `--offload-arch=gfx1201` exactly.
 `--profile` per-kernel accounting. Keep G2a open until 256-token greedy parity and
 the equivalent Q5_K_XL oracle sweep are green; keep G2b open until the formal
 depth-0/depth-32768 512-token benchmark protocol is complete.
+
+---
+
+## 2026-08-23 — Session 12 (Stage 2 task 6: HIP graph + profile, GPT-5.6 Sol)
+
+**Stage 2 task 6 is complete.** The default decode path now replays one captured
+HIP graph per token, and `--profile` reports the K/A/H stage table from an eager
+diagnostic step. Graph and eager execution are bit-identical.
+
+### 1. Stable graph inputs and convolution parity
+
+The runtime arena now contains a three-int device control block
+`{token, position, n_past}`. A pinned host mirror is the source of the graph's first
+H2D node. The repacked embedding gather and A2 kernel optionally read this device
+control, so changing tokens, RoPE positions, and cache length never requires graph
+node updates or recapture.
+
+K2's immutable-input convolution ping-pong cannot use one graph with host-selected
+pointers. The engine therefore captures two otherwise identical executables:
+
+- even cache length: convolution bank A -> B;
+- odd cache length: convolution bank B -> A.
+
+The host selects by `n_past & 1`. This preserves D10's race-free ownership without
+copying 6 MiB of convolution state after every token. Both graphs contain exactly
+**1,141 nodes**. IQ constant tables are initialized before capture; no allocation,
+symbol copy, or changing host argument is hidden inside replay. `--no-graph`
+retains eager mode for diagnosis.
+
+### 2. Graph correctness and replay equivalence
+
+Command:
+
+```bash
+./build/release/tests/test_gpu_forward
+```
+
+Result:
+
+```text
+GREEN — 64-layer 1141-node graph decode top-1 2614;
+        reset replay is bit-exact and graph == eager; 25 checks
+```
+
+The test destroys the graph engine before loading a separate eager engine (so it
+never double-allocates the 16 GiB model), then compares every one of 248,320 fp32
+logits bit-for-bit. A 31-position p1 run independently confirmed all recurrent
+steps and both graph parities:
+
+```bash
+cmp /tmp/ns_graph_p1.bin /tmp/ns_gpu_p1.bin
+sha256sum /tmp/ns_graph_p1.bin /tmp/ns_gpu_p1.bin
+```
+
+Both hashes were:
+
+```text
+0b9507a344459877cf89f2be367bc0976359c0092bf80eeb2819f665fe4776e9
+```
+
+### 3. Built-in K/A/H stage profile
+
+`--profile` selects eager execution and brackets each planned K1..K5, A1..A5,
+H1/H2 interval with HIP timestamp events. It aggregates all layer calls into mean,
+total, min, and max. This makes fusion debt visible: a “K1” interval currently
+contains norm, activation quantization, and four independent GEMV launches; after
+task 7 it should become the planned fused sequence.
+
+Command (token 760 warms clocks; token 3712 is the reported step):
+
+```bash
+./build/release/ns gpu-eval \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 760,3712 --ctx 2 --topk 1 --profile
+```
+
+The step streams the complete >16 GiB model, well beyond the 1 GB minimum:
+
+| stage | calls | mean us | total us | PLAN target/status |
+|---|---:|---:|---:|---|
+| E embedding | 1 | 22.84 | 22.84 | diagnostic |
+| K1 norm+projections | 48 | 130.87 | 6,281.92 | <=100 RED |
+| K2 GDN | 48 | 19.02 | 912.81 | <=15 RED |
+| K3 output+residual | 48 | 50.77 | 2,436.73 | <=43 RED |
+| K4 FFN up+gate | 48 | 206.65 | 9,918.97 | <=185/200 RED |
+| K5 FFN down+residual | 48 | 105.85 | 5,080.75 | <=100/122 mixed |
+| A1 norm+qkv | 16 | 109.36 | 1,749.77 | <=105 RED |
+| A2 attention | 16 | 10.31 | 165.00 | <=20 GREEN |
+| A3 output+residual | 16 | 51.90 | 830.40 | <=43 RED |
+| A4 FFN up+gate | 16 | 212.74 | 3,403.82 | <=185/200 RED |
+| A5 FFN down+residual | 16 | 105.71 | 1,691.29 | <=100/122 mixed |
+| H1 final norm | 1 | 19.32 | 19.32 | diagnostic |
+| H2 lm_head | 1 | 1,659.53 | 1,659.53 | <=1680 GREEN |
+| **profiled kernel total** | | | **34,173.15 us** | ~29.26 t/s |
+
+This is a localization profile, not G2b: it is one measured post-warmup token with
+timestamp instrumentation, not the 512-token/three-run benchmark protocol. It
+shows the isolated GEMV/K2 wins survive in-model but small launches and missing
+fusion account for the remaining gap.
+
+### 4. Graph launch observation
+
+Thirty p1 steps after the capture-bearing first token were compared with the same
+eager sequence. Each token streams the full model, so the working set is honest:
+
+```text
+graph positions 1..30: 33.000 ms mean (30)
+eager positions 1..30: 33.767 ms mean (30)
+```
+
+The CLI prints milliseconds to three decimals, so this only establishes the
+direction (~2.3% lower wall time); G2b will use event/high-resolution timing and
+the required 512-token protocol.
+
+### 5. Full regression suite
+
+```bash
+git diff --check
+make -j$(nproc) test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. All
+HIP compilation used `--offload-arch=gfx1201` exactly.
+
+**NEXT:** Stage 2 task 7 performance push. Use the profile above as the ordered
+worklist: fuse norm/quant/projection setup and residual/FFN elementwise work, recover
+K2's isolated <=15 us behavior in-model, reduce the 1,141-node graph toward PLAN's
+~325 dispatches, then run formal G2a/G2b on both GGUF files at depth 0 and 32,768.

@@ -49,6 +49,7 @@ static int usage() {
             "       ns gpu-eval <model.gguf> --tokens a,b,c [--topk N]\n"
             "           [--all-pos] [--dump-logits FILE] [--generate N]\n"
             "           [--dump-tokens FILE] [--ctx N] [--fp32-gemv]\n"
+            "           [--no-graph] [--profile]\n"
             "  runs the eager gfx1201 decode engine. Integer Q8_K GEMV is the\n"
             "  default; --fp32-gemv selects the dequant-and-FMA diagnostic path.\n");
     return 2;
@@ -162,7 +163,7 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
                         int topk, bool all_pos, const std::string& dump_path,
                         int generate, const std::string& token_path,
                         int requested_context, bool fp32_gemv,
-                        bool allow_display) {
+                        bool allow_display, bool no_graph, bool profile) {
     std::vector<int32_t> tokens = parse_tokens(tokens_csv);
     if (tokens.empty()) {
         fprintf(stderr, "ns: --tokens is empty\n");
@@ -175,6 +176,8 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
         ? requested_context : std::max(256, needed_context);
     options.allow_display = allow_display;
     options.integer_gemv = !fp32_gemv;
+    options.use_graph = !no_graph && !profile;
+    options.profile = profile;
     if (options.max_context < needed_context) {
         fprintf(stderr, "ns: --ctx %d is smaller than the requested %d-token run\n",
                 options.max_context, needed_context);
@@ -195,11 +198,12 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
            weight_stats.device_arch.c_str(), weight_stats.device_pci.c_str(),
            now_sec() - load_start);
     printf("weights %.3f GiB; runtime %.3f GiB (state %.3f, KV %.3f, scratch %.3f); "
-           "ctx %d; %s GEMV\n",
+           "ctx %d; %s GEMV; %s\n",
            weight_stats.arena_bytes / GiB, runtime_stats.arena_bytes / GiB,
            runtime_stats.state_bytes / GiB, runtime_stats.kv_bytes / GiB,
            runtime_stats.scratch_bytes / GiB, runtime_stats.max_context,
-           runtime_stats.integer_gemv ? "Q8_K integer" : "fp32-dequant");
+           runtime_stats.integer_gemv ? "Q8_K integer" : "fp32-dequant",
+           runtime_stats.graph_enabled ? "HIP graph" : "eager");
 
     std::vector<float> logits;
     FILE* dump = dump_path.empty() ? nullptr : fopen(dump_path.c_str(), "wb");
@@ -276,6 +280,22 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
     if (dump) {
         fclose(dump);
         printf("logits written to %s\n", dump_path.c_str());
+    }
+    if (runtime_stats.graph_captured)
+        printf("HIP graph captured: %zu nodes per even/odd executable\n",
+               runtime_stats.graph_nodes_per_parity);
+    if (!engine.last_profile().empty()) {
+        double profiled_total = 0.0;
+        printf("\n%-24s %7s %10s %10s %10s %10s\n", "profile stage", "calls",
+               "mean us", "total us", "min us", "max us");
+        for (const GpuProfileEntry& entry : engine.last_profile()) {
+            printf("%-24s %7zu %10.2f %10.2f %10.2f %10.2f\n",
+                   entry.name.c_str(), entry.calls, entry.mean_us, entry.total_us,
+                   entry.min_us, entry.max_us);
+            profiled_total += entry.total_us;
+        }
+        printf("%-24s %7s %10s %10.2f\n", "PROFILED KERNEL TOTAL", "-", "-",
+               profiled_total);
     }
     return 0;
 }
@@ -443,6 +463,8 @@ int main(int argc, char** argv) {
         bool all_pos = false;
         bool fp32_gemv = false;
         bool allow_display = false;
+        bool no_graph = false;
+        bool profile = false;
         for (int index = 3; index < argc; index++) {
             const std::string argument = argv[index];
             if (argument == "--tokens" && index + 1 < argc) tokens = argv[++index];
@@ -459,12 +481,15 @@ int main(int argc, char** argv) {
                 context = atoi(argv[++index]);
             else if (argument == "--fp32-gemv") fp32_gemv = true;
             else if (argument == "--allow-display") allow_display = true;
+            else if (argument == "--no-graph") no_graph = true;
+            else if (argument == "--profile") profile = true;
             else return usage();
         }
         if (generate < 0 || context < 0 || topk <= 0 ||
             (!token_dump.empty() && generate == 0)) return usage();
         return cmd_gpu_eval(argv[2], tokens, topk, all_pos, dump, generate,
-                            token_dump, context, fp32_gemv, allow_display);
+                            token_dump, context, fp32_gemv, allow_display,
+                            no_graph, profile);
     }
     if (cmd == "inspect") {
         if (argc < 3) return usage();

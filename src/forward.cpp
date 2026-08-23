@@ -14,6 +14,7 @@
 #include <climits>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <new>
 #include <utility>
 
@@ -89,6 +90,7 @@ struct RuntimeOffsets {
     size_t ffn_up = 0;
     size_t ffn_activated = 0;
     size_t logits = 0;
+    size_t step_control = 0;
     size_t conv_a = 0;
     size_t conv_b = 0;
     size_t ssm = 0;
@@ -113,6 +115,7 @@ struct DeviceBuffers {
     float* ffn_up = nullptr;
     float* ffn_activated = nullptr;
     float* logits = nullptr;
+    int32_t* step_control = nullptr;
     float* conv_a = nullptr;
     float* conv_b = nullptr;
     float* ssm = nullptr;
@@ -145,6 +148,12 @@ struct GpuLayerWeights {
     int state_index = -1;
 };
 
+struct PendingProfile {
+    const char* name = nullptr;
+    hipEvent_t start = nullptr;
+    hipEvent_t stop = nullptr;
+};
+
 const float* f32_data(const GpuTensor* tensor) {
     return reinterpret_cast<const float*>(tensor->data);
 }
@@ -164,10 +173,27 @@ struct GpuEngine::Impl {
     int past = 0;
     bool conv_bank_b = false;
     bool poisoned = false;
+    int32_t* host_step_control = nullptr;
+    hipGraphExec_t graph_exec[2] = {nullptr, nullptr};
+    std::vector<PendingProfile> pending_profile;
+    std::vector<GpuProfileEntry> last_profile;
 
     ~Impl() { clear_runtime(); }
 
     void clear_runtime() {
+        clear_pending_profile();
+        for (hipGraphExec_t& executable : graph_exec) {
+            if (executable) {
+                const hipError_t ignored = hipGraphExecDestroy(executable);
+                (void)ignored;
+            }
+            executable = nullptr;
+        }
+        if (host_step_control) {
+            const hipError_t ignored = hipHostFree(host_step_control);
+            (void)ignored;
+        }
+        host_step_control = nullptr;
         if (runtime_arena) {
             const hipError_t ignored = hipFree(runtime_arena);
             (void)ignored;
@@ -182,6 +208,21 @@ struct GpuEngine::Impl {
         past = 0;
         conv_bank_b = false;
         poisoned = false;
+        last_profile.clear();
+    }
+
+    void clear_pending_profile() {
+        for (PendingProfile& record : pending_profile) {
+            if (record.stop) {
+                const hipError_t ignored = hipEventDestroy(record.stop);
+                (void)ignored;
+            }
+            if (record.start) {
+                const hipError_t ignored = hipEventDestroy(record.start);
+                (void)ignored;
+            }
+        }
+        pending_profile.clear();
     }
 
     const GpuTensor* need(const std::string& name, std::string* error) {
@@ -296,6 +337,7 @@ struct GpuEngine::Impl {
         offsets.ffn_up = plan.take<float>(config.n_ff);
         offsets.ffn_activated = plan.take<float>(config.n_ff);
         offsets.logits = plan.take<float>(config.n_vocab);
+        offsets.step_control = plan.take<int32_t>(3);
 
         const size_t conv_per_layer =
             (size_t)(config.ssm_conv_kernel - 1) * config.gdn_qkv_dim();
@@ -353,6 +395,7 @@ struct GpuEngine::Impl {
         buffers.ffn_up = at<float>(offsets.ffn_up);
         buffers.ffn_activated = at<float>(offsets.ffn_activated);
         buffers.logits = at<float>(offsets.logits);
+        buffers.step_control = at<int32_t>(offsets.step_control);
         buffers.conv_a = at<float>(offsets.conv_a);
         buffers.conv_b = at<float>(offsets.conv_b);
         buffers.ssm = at<float>(offsets.ssm);
@@ -365,6 +408,11 @@ struct GpuEngine::Impl {
         stats.scratch_bytes = arena_bytes - stats.state_bytes - stats.kv_bytes;
         stats.max_context = options.max_context;
         stats.integer_gemv = options.integer_gemv;
+        stats.graph_enabled = options.use_graph;
+        if (options.use_graph &&
+            !hip_result(hipHostMalloc(reinterpret_cast<void**>(&host_step_control),
+                                      3 * sizeof(int32_t), hipHostMallocDefault),
+                        "hipHostMalloc(step control)", error)) return false;
         return reset_state(error);
     }
 
@@ -394,6 +442,8 @@ struct GpuEngine::Impl {
         past = 0;
         conv_bank_b = false;
         poisoned = false;
+        clear_pending_profile();
+        last_profile.clear();
         return true;
     }
 
@@ -419,27 +469,88 @@ struct GpuEngine::Impl {
         return gpu_gemv_f32(*tensor, input, result, weights.stream(), error);
     }
 
-    bool forward(int32_t token, int32_t position, std::vector<float>* host_logits,
-                 std::string* error) {
-        if (!runtime_arena || !host_logits) {
-            if (error) *error = "GPU engine is not loaded or logits output is null";
+    bool profile_begin(const char* name, size_t* record_index,
+                       std::string* error) {
+        if (!options.profile) {
+            *record_index = std::numeric_limits<size_t>::max();
+            return true;
+        }
+        PendingProfile record;
+        record.name = name;
+        if (!hip_result(hipEventCreate(&record.start), "create profile start", error) ||
+            !hip_result(hipEventCreate(&record.stop), "create profile stop", error)) {
+            if (record.start) {
+                const hipError_t ignored = hipEventDestroy(record.start);
+                (void)ignored;
+            }
             return false;
         }
-        if (poisoned) {
-            if (error) *error = "GPU state is invalid after a failed step; reset it";
+        if (!hip_result(hipEventRecord(record.start, weights.stream()),
+                        "record profile start", error)) {
+            const hipError_t ignored_start = hipEventDestroy(record.start);
+            const hipError_t ignored_stop = hipEventDestroy(record.stop);
+            (void)ignored_start;
+            (void)ignored_stop;
             return false;
         }
+        pending_profile.push_back(record);
+        *record_index = pending_profile.size() - 1;
+        return true;
+    }
+
+    bool profile_end(size_t record_index, std::string* error) {
+        if (record_index == std::numeric_limits<size_t>::max()) return true;
+        return hip_result(
+            hipEventRecord(pending_profile[record_index].stop, weights.stream()),
+            "record profile stop", error);
+    }
+
+    bool finalize_profile(std::string* error) {
+        last_profile.clear();
+        if (!options.profile) return true;
+        std::map<std::string, size_t> indices;
+        for (PendingProfile& record : pending_profile) {
+            float milliseconds = 0.0f;
+            if (!hip_result(hipEventElapsedTime(&milliseconds, record.start,
+                                                record.stop),
+                            "read profile interval", error)) return false;
+            const double microseconds = milliseconds * 1000.0;
+            const std::string name = record.name;
+            auto found = indices.find(name);
+            if (found == indices.end()) {
+                GpuProfileEntry entry;
+                entry.name = name;
+                entry.min_us = microseconds;
+                entry.max_us = microseconds;
+                last_profile.push_back(entry);
+                found = indices.emplace(name, last_profile.size() - 1).first;
+            }
+            GpuProfileEntry& entry = last_profile[found->second];
+            entry.calls++;
+            entry.total_us += microseconds;
+            entry.min_us = std::min(entry.min_us, microseconds);
+            entry.max_us = std::max(entry.max_us, microseconds);
+        }
+        for (GpuProfileEntry& entry : last_profile)
+            entry.mean_us = entry.total_us / entry.calls;
+        clear_pending_profile();
+        return true;
+    }
+
+    bool enqueue_model(int32_t token, int32_t position, int32_t past_value,
+                       const int32_t* device_control, float* conv_input_bank,
+                       float* conv_output_bank, std::string* error) {
         const Config& config = weights.config();
-        if (token < 0 || (uint32_t)token >= config.n_vocab || position < 0 ||
-            past >= options.max_context) {
-            if (error) *error = "token, position, or KV cache extent is invalid";
-            return false;
-        }
         const hipStream_t stream = weights.stream();
-        if (!gpu_get_row_f32(*token_embedding, token, buffers.hidden, stream, error)) {
-            poisoned = true;
-            return false;
-        }
+        size_t profile_record = 0;
+        if (!profile_begin("E embedding", &profile_record, error)) return false;
+        const bool gathered = device_control
+            ? gpu_get_row_f32_device(*token_embedding, device_control,
+                                     buffers.hidden, stream, error)
+            : gpu_get_row_f32(*token_embedding, token, buffers.hidden, stream,
+                              error);
+        if (!gathered) return false;
+        if (!profile_end(profile_record, error)) return false;
 
         const size_t conv_per_layer =
             (size_t)(config.ssm_conv_kernel - 1) * config.gdn_qkv_dim();
@@ -448,11 +559,11 @@ struct GpuEngine::Impl {
             config.ssm_state_size;
         const size_t cache_per_layer =
             (size_t)options.max_context * ATTENTION_KV_DIM;
-        float* conv_input_bank = conv_bank_b ? buffers.conv_b : buffers.conv_a;
-        float* conv_output_bank = conv_bank_b ? buffers.conv_a : buffers.conv_b;
 
         for (uint32_t layer = 0; layer < config.n_layer_main; layer++) {
             const GpuLayerWeights& item = layers[layer];
+            if (!profile_begin(item.is_attention ? "A1 norm+qkv" : "K1 norm+projections",
+                               &profile_record, error)) return false;
             if (!gpu_rms_norm(buffers.hidden, f32_data(item.attn_norm),
                               buffers.normalized, config.n_embd, config.rms_eps,
                               stream, error))
@@ -465,26 +576,38 @@ struct GpuEngine::Impl {
                     !gemv(item.attn_k, buffers.normalized, buffers.key, error) ||
                     !gemv(item.attn_v, buffers.normalized, buffers.value, error))
                     return set_layer_error(layer, "attention projections", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "A1 profile", error);
                 const size_t cache_offset =
                     (size_t)item.state_index * cache_per_layer;
-                const AttentionStepArgs args = {
-                    buffers.qg,
-                    buffers.key,
-                    buffers.value,
-                    f32_data(item.attn_q_norm),
-                    f32_data(item.attn_k_norm),
-                    buffers.k_cache + cache_offset,
-                    buffers.v_cache + cache_offset,
-                    buffers.gated,
-                    past,
-                    options.max_context,
-                    position,
-                };
+                AttentionStepArgs args;
+                args.qg = buffers.qg;
+                args.k = buffers.key;
+                args.v = buffers.value;
+                args.q_norm = f32_data(item.attn_q_norm);
+                args.k_norm = f32_data(item.attn_k_norm);
+                args.k_cache = buffers.k_cache + cache_offset;
+                args.v_cache = buffers.v_cache + cache_offset;
+                args.gated_output = buffers.gated;
+                args.step_control = device_control;
+                args.n_past = past_value;
+                args.capacity = options.max_context;
+                args.position = position;
+                if (!profile_begin("A2 attention", &profile_record, error))
+                    return set_layer_error(layer, "A2 profile", error);
                 if (!gpu_attention_step(args, stream, error))
                     return set_layer_error(layer, "A2", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "A2 profile", error);
+                if (!profile_begin("A3 output+residual", &profile_record, error))
+                    return set_layer_error(layer, "A3 profile", error);
                 if (!quantize(buffers.gated, config.attn_o_dim(), error) ||
-                    !gemv(item.attn_out, buffers.gated, buffers.residual, error))
+                    !gemv(item.attn_out, buffers.gated, buffers.residual, error) ||
+                    !gpu_add_in_place(buffers.hidden, buffers.residual,
+                                      config.n_embd, stream, error))
                     return set_layer_error(layer, "attention output", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "A3 profile", error);
             } else {
                 if (!gemv(item.attn_qkv, buffers.normalized, buffers.gdn_mixed,
                           error) ||
@@ -494,6 +617,8 @@ struct GpuEngine::Impl {
                           error) ||
                     !gemv(item.ssm_beta, buffers.normalized, buffers.beta, error))
                     return set_layer_error(layer, "GDN projections", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "K1 profile", error);
                 const size_t conv_offset =
                     (size_t)item.state_index * conv_per_layer;
                 const size_t ssm_offset =
@@ -512,16 +637,26 @@ struct GpuEngine::Impl {
                     buffers.ssm + ssm_offset,
                     buffers.gated,
                 };
+                if (!profile_begin("K2 GDN", &profile_record, error))
+                    return set_layer_error(layer, "K2 profile", error);
                 if (!gpu_gdn_step(args, stream, error))
                     return set_layer_error(layer, "K2", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "K2 profile", error);
+                if (!profile_begin("K3 output+residual", &profile_record, error))
+                    return set_layer_error(layer, "K3 profile", error);
                 if (!quantize(buffers.gated, config.ssm_inner_size, error) ||
-                    !gemv(item.ssm_out, buffers.gated, buffers.residual, error))
+                    !gemv(item.ssm_out, buffers.gated, buffers.residual, error) ||
+                    !gpu_add_in_place(buffers.hidden, buffers.residual,
+                                      config.n_embd, stream, error))
                     return set_layer_error(layer, "GDN output", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "K3 profile", error);
             }
-            if (!gpu_add_in_place(buffers.hidden, buffers.residual, config.n_embd,
-                                  stream, error))
-                return set_layer_error(layer, "attention residual", error);
 
+            if (!profile_begin(item.is_attention ? "A4 FFN up+gate" : "K4 FFN up+gate",
+                               &profile_record, error))
+                return set_layer_error(layer, "FFN stage 4 profile", error);
             if (!gpu_rms_norm(buffers.hidden, f32_data(item.post_attn_norm),
                               buffers.normalized, config.n_embd, config.rms_eps,
                               stream, error) ||
@@ -531,26 +666,147 @@ struct GpuEngine::Impl {
                 !gemv(item.ffn_up, buffers.normalized, buffers.ffn_up, error) ||
                 !gpu_silu_multiply(buffers.ffn_gate, buffers.ffn_up,
                                    buffers.ffn_activated, config.n_ff, stream,
-                                   error) ||
-                !quantize(buffers.ffn_activated, config.n_ff, error) ||
+                                   error))
+                return set_layer_error(layer, "FFN up/gate", error);
+            if (!profile_end(profile_record, error))
+                return set_layer_error(layer, "FFN stage 4 profile", error);
+            if (!profile_begin(item.is_attention ? "A5 FFN down+residual"
+                                                 : "K5 FFN down+residual",
+                               &profile_record, error))
+                return set_layer_error(layer, "FFN stage 5 profile", error);
+            if (!quantize(buffers.ffn_activated, config.n_ff, error) ||
                 !gemv(item.ffn_down, buffers.ffn_activated, buffers.residual,
                       error) ||
                 !gpu_add_in_place(buffers.hidden, buffers.residual, config.n_embd,
                                   stream, error))
                 return set_layer_error(layer, "FFN", error);
+            if (!profile_end(profile_record, error))
+                return set_layer_error(layer, "FFN stage 5 profile", error);
         }
 
+        if (!profile_begin("H1 final norm", &profile_record, error)) return false;
         if (!gpu_rms_norm(buffers.hidden, f32_data(output_norm),
                           buffers.normalized, config.n_embd, config.rms_eps,
                           stream, error) ||
             !quantize(buffers.normalized, config.n_embd, error) ||
-            !gemv(output, buffers.normalized, buffers.logits, error)) {
+            !profile_end(profile_record, error) ||
+            !profile_begin("H2 lm_head", &profile_record, error) ||
+            !gemv(output, buffers.normalized, buffers.logits, error) ||
+            !profile_end(profile_record, error)) {
             poisoned = true;
             if (error)
                 *error = "output head" +
                          (error->empty() ? std::string(" failed")
                                          : std::string(": ") + *error);
             return false;
+        }
+        return true;
+    }
+
+    bool capture_one_graph(int parity, std::string* error) {
+        const hipStream_t stream = weights.stream();
+        hipGraph_t graph = nullptr;
+        if (!hip_result(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+                        "begin decode graph capture", error)) return false;
+        bool enqueued = hip_result(
+            hipMemcpyAsync(buffers.step_control, host_step_control,
+                           3 * sizeof(int32_t), hipMemcpyHostToDevice, stream),
+            "capture step-control copy", error);
+        float* conv_input = parity ? buffers.conv_b : buffers.conv_a;
+        float* conv_output = parity ? buffers.conv_a : buffers.conv_b;
+        if (enqueued)
+            enqueued = enqueue_model(0, 0, 0, buffers.step_control, conv_input,
+                                     conv_output, error);
+        const hipError_t end_status = hipStreamEndCapture(stream, &graph);
+        if (!enqueued || end_status != hipSuccess || !graph) {
+            if (graph) {
+                const hipError_t ignored = hipGraphDestroy(graph);
+                (void)ignored;
+            }
+            if (end_status != hipSuccess)
+                hip_result(end_status, "end decode graph capture", error);
+            return false;
+        }
+        size_t nodes = 0;
+        if (!hip_result(hipGraphGetNodes(graph, nullptr, &nodes),
+                        "count decode graph nodes", error)) {
+            const hipError_t ignored = hipGraphDestroy(graph);
+            (void)ignored;
+            return false;
+        }
+        char log[2048] = {};
+        hipGraphNode_t error_node = nullptr;
+        const hipError_t instantiate = hipGraphInstantiate(
+            &graph_exec[parity], graph, &error_node, log, sizeof(log));
+        const hipError_t destroy_status = hipGraphDestroy(graph);
+        (void)destroy_status;
+        if (instantiate != hipSuccess) {
+            hip_result(instantiate, "instantiate decode graph", error);
+            if (error && log[0]) *error += ": " + std::string(log);
+            return false;
+        }
+        if (parity == 0) stats.graph_nodes_per_parity = nodes;
+        else if (nodes != stats.graph_nodes_per_parity) {
+            if (error) *error = "even/odd decode graphs have different node counts";
+            return false;
+        }
+        return true;
+    }
+
+    bool capture_graphs(std::string* error) {
+        if (graph_exec[0] && graph_exec[1]) return true;
+        if (!hip_result(hipStreamSynchronize(weights.stream()),
+                        "synchronize before graph capture", error)) return false;
+        host_step_control[0] = 0;
+        host_step_control[1] = 0;
+        host_step_control[2] = 0;
+        if (!capture_one_graph(0, error) || !capture_one_graph(1, error)) {
+            poisoned = true;
+            return false;
+        }
+        stats.graph_captured = true;
+        return true;
+    }
+
+    bool forward(int32_t token, int32_t position, std::vector<float>* host_logits,
+                 std::string* error) {
+        if (!runtime_arena || !host_logits) {
+            if (error) *error = "GPU engine is not loaded or logits output is null";
+            return false;
+        }
+        if (poisoned) {
+            if (error) *error = "GPU state is invalid after a failed step; reset it";
+            return false;
+        }
+        const Config& config = weights.config();
+        if (token < 0 || (uint32_t)token >= config.n_vocab || position < 0 ||
+            past >= options.max_context) {
+            if (error) *error = "token, position, or KV cache extent is invalid";
+            return false;
+        }
+        if (options.profile) {
+            clear_pending_profile();
+            last_profile.clear();
+        }
+        const hipStream_t stream = weights.stream();
+        if (options.use_graph) {
+            if (!capture_graphs(error)) return false;
+            host_step_control[0] = token;
+            host_step_control[1] = position;
+            host_step_control[2] = past;
+            if (!hip_result(hipGraphLaunch(graph_exec[past & 1], stream),
+                            "launch decode graph", error)) {
+                poisoned = true;
+                return false;
+            }
+        } else {
+            float* conv_input = conv_bank_b ? buffers.conv_b : buffers.conv_a;
+            float* conv_output = conv_bank_b ? buffers.conv_a : buffers.conv_b;
+            if (!enqueue_model(token, position, past, nullptr, conv_input,
+                               conv_output, error)) {
+                poisoned = true;
+                return false;
+            }
         }
         host_logits->resize(config.n_vocab);
         if (!hip_result(hipMemcpyAsync(host_logits->data(), buffers.logits,
@@ -559,6 +815,10 @@ struct GpuEngine::Impl {
                         "copy logits to host", error) ||
             !hip_result(hipStreamSynchronize(stream), "synchronize decode step",
                         error)) {
+            poisoned = true;
+            return false;
+        }
+        if (!finalize_profile(error)) {
             poisoned = true;
             return false;
         }
@@ -583,9 +843,14 @@ bool GpuEngine::load(const std::string& path, const GpuEngineOptions& options,
         if (error) *error = "invalid maximum context";
         return false;
     }
+    if (options.profile && options.use_graph) {
+        if (error) *error = "profiling requires eager mode (set use_graph=false)";
+        return false;
+    }
     impl_->options = options;
     if (!impl_->weights.load(path, options.allow_display, false, error) ||
-        !impl_->resolve_weights(error) || !impl_->allocate_runtime(error)) {
+        !gpu_prepare_gemv(error) || !impl_->resolve_weights(error) ||
+        !impl_->allocate_runtime(error)) {
         impl_->clear_runtime();
         impl_->weights.reset();
         return false;
@@ -608,5 +873,8 @@ int GpuEngine::n_past() const { return impl_->past; }
 const Config& GpuEngine::config() const { return impl_->weights.config(); }
 const GpuLoadStats& GpuEngine::weight_stats() const { return impl_->weights.stats(); }
 const GpuRuntimeStats& GpuEngine::runtime_stats() const { return impl_->stats; }
+const std::vector<GpuProfileEntry>& GpuEngine::last_profile() const {
+    return impl_->last_profile;
+}
 
 }  // namespace ns

@@ -16,6 +16,17 @@ struct GpuEngineOptions {
     int max_context = 32768;
     bool allow_display = false;
     bool integer_gemv = true;
+    bool use_graph = true;
+    bool profile = false;
+};
+
+struct GpuProfileEntry {
+    std::string name;
+    size_t calls = 0;
+    double total_us = 0.0;
+    double mean_us = 0.0;
+    double min_us = 0.0;
+    double max_us = 0.0;
 };
 
 struct GpuRuntimeStats {
@@ -27,6 +38,9 @@ struct GpuRuntimeStats {
     int gdn_layers = 0;
     int attention_layers = 0;
     bool integer_gemv = false;
+    bool graph_enabled = false;
+    bool graph_captured = false;
+    size_t graph_nodes_per_parity = 0;
 };
 
 // Owns immutable uploaded weights plus one mutable decode context. `forward` is
@@ -51,6 +65,7 @@ public:
     const Config& config() const;
     const GpuLoadStats& weight_stats() const;
     const GpuRuntimeStats& runtime_stats() const;
+    const std::vector<GpuProfileEntry>& last_profile() const;
 
 private:
     struct Impl;

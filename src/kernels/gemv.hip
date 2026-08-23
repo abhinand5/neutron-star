@@ -883,7 +883,10 @@ void gemv_q8_K_split_kernel(const uint8_t* weights, RepackLayout layout,
 template <int Type>
 __global__ void get_row_quant_kernel(const uint8_t* weights, RepackLayout layout,
                                      float* output, int rows, int elements_per_row,
-                                     int selected_row) {
+                                     int selected_row_value,
+                                     const int32_t* selected_row_device) {
+    const int selected_row = selected_row_device
+                                 ? *selected_row_device : selected_row_value;
     const int quant_block = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int blocks_per_row = elements_per_row / layout.block_elements;
     if (quant_block >= blocks_per_row) return;
@@ -962,16 +965,20 @@ static void launch_q8_K(const GpuTensor& tensor, const block_q8_K* input,
 
 template <int Type>
 static void launch_get_row(const GpuTensor& tensor, int64_t row, float* output,
-                           hipStream_t stream) {
+                           const int32_t* row_device, hipStream_t stream) {
     const int blocks = (int)(tensor.ne[0] / tensor.layout.block_elements);
     constexpr int threads = 64;
     const dim3 grid((uint32_t)(blocks + threads - 1) / threads);
     hipLaunchKernelGGL((get_row_quant_kernel<Type>), grid, dim3(threads), 0, stream,
                        tensor.data, tensor.layout, output, (int)tensor.ne[1],
-                       (int)tensor.ne[0], (int)row);
+                       (int)tensor.ne[0], (int)row, row_device);
 }
 
 }  // namespace
+
+bool gpu_prepare_gemv(std::string* error) {
+    return initialize_iq_tables(error);
+}
 
 bool gpu_gemv_f32(const GpuTensor& tensor, const float* input, float* output,
                   hipStream_t stream, std::string* error) {
@@ -1078,8 +1085,12 @@ bool gpu_get_row_f32(const GpuTensor& tensor, int64_t row, float* output,
         return false;
     }
     switch (tensor.type) {
-        case NS_Q4_K: launch_get_row<NS_Q4_K>(tensor, row, output, stream); break;
-        case NS_Q6_K: launch_get_row<NS_Q6_K>(tensor, row, output, stream); break;
+        case NS_Q4_K:
+            launch_get_row<NS_Q4_K>(tensor, row, output, nullptr, stream);
+            break;
+        case NS_Q6_K:
+            launch_get_row<NS_Q6_K>(tensor, row, output, nullptr, stream);
+            break;
         default:
             if (error)
                 *error = tensor.name + ": embedding gather is unavailable for " +
@@ -1087,6 +1098,30 @@ bool gpu_get_row_f32(const GpuTensor& tensor, int64_t row, float* output,
             return false;
     }
     return hip_result(hipGetLastError(), "launch embedding gather", error);
+}
+
+bool gpu_get_row_f32_device(const GpuTensor& tensor, const int32_t* row,
+                            float* output, hipStream_t stream, std::string* error) {
+    if (tensor.n_dims != 2 || tensor.ne[0] <= 0 || tensor.ne[0] > INT32_MAX ||
+        tensor.ne[1] <= 0 || tensor.ne[1] > INT32_MAX || !tensor.data || !row ||
+        !output || !stream) {
+        if (error) *error = tensor.name + ": invalid device embedding row arguments";
+        return false;
+    }
+    switch (tensor.type) {
+        case NS_Q4_K:
+            launch_get_row<NS_Q4_K>(tensor, 0, output, row, stream);
+            break;
+        case NS_Q6_K:
+            launch_get_row<NS_Q6_K>(tensor, 0, output, row, stream);
+            break;
+        default:
+            if (error)
+                *error = tensor.name + ": embedding gather is unavailable for " +
+                         std::string(type_info(tensor.type).name);
+            return false;
+    }
+    return hip_result(hipGetLastError(), "launch device embedding gather", error);
 }
 
 }  // namespace ns
