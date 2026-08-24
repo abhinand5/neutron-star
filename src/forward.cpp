@@ -206,6 +206,7 @@ struct GpuEngine::Impl {
     FILE* activation_file = nullptr;
     uint32_t activation_count = 0;
     std::vector<float> activation_staging;
+    std::vector<block_q8_K> activation_q8_staging;
     hipGraphExec_t graph_exec[2] = {nullptr, nullptr};
     std::vector<PendingProfile> pending_profile;
     std::vector<GpuProfileEntry> last_profile;
@@ -221,6 +222,7 @@ struct GpuEngine::Impl {
         activation_file = nullptr;
         activation_count = 0;
         activation_staging.clear();
+        activation_q8_staging.clear();
     }
 
     void clear_runtime() {
@@ -278,22 +280,12 @@ struct GpuEngine::Impl {
         return true;
     }
 
-    bool dump_activation(const char* what, uint32_t layer,
-                         const float* device_values, size_t elements,
-                         int32_t position, std::string* error) {
-        if (!activation_file || position != options.debug_position) return true;
-        activation_staging.resize(elements);
-        const hipStream_t stream = weights.stream();
-        if (!hip_result(
-                hipMemcpyAsync(activation_staging.data(), device_values,
-                               elements * sizeof(float), hipMemcpyDeviceToHost,
-                               stream),
-                "copy GPU debug activation", error) ||
-            !hip_result(hipStreamSynchronize(stream),
-                        "synchronize GPU debug activation", error))
-            return false;
+    bool write_activation_record(const char* what, int32_t layer,
+                                 size_t elements, std::string* error) {
         char name[64];
-        const int length = snprintf(name, sizeof(name), "%s-%u", what, layer);
+        const int length = layer >= 0
+            ? snprintf(name, sizeof(name), "%s-%d", what, layer)
+            : snprintf(name, sizeof(name), "%s", what);
         if (length <= 0 || (size_t)length >= sizeof(name)) {
             if (error) *error = "GPU debug activation name is too long";
             return false;
@@ -311,6 +303,51 @@ struct GpuEngine::Impl {
         }
         activation_count++;
         return true;
+    }
+
+    bool dump_activation(const char* what, int32_t layer,
+                         const float* device_values, size_t elements,
+                         int32_t position, std::string* error) {
+        if (!activation_file || position != options.debug_position) return true;
+        activation_staging.resize(elements);
+        const hipStream_t stream = weights.stream();
+        if (!hip_result(
+                hipMemcpyAsync(activation_staging.data(), device_values,
+                               elements * sizeof(float), hipMemcpyDeviceToHost,
+                               stream),
+                "copy GPU debug activation", error) ||
+            !hip_result(hipStreamSynchronize(stream),
+                        "synchronize GPU debug activation", error))
+            return false;
+        return write_activation_record(what, layer, elements, error);
+    }
+
+    bool dump_q8_activation(const char* what, int32_t layer,
+                            const block_q8_K* device_values, size_t elements,
+                            int32_t position, std::string* error) {
+        if (!activation_file || position != options.debug_position) return true;
+        if (elements % QK_K != 0) {
+            if (error) *error = "Q8 debug activation is not block aligned";
+            return false;
+        }
+        const size_t blocks = elements / QK_K;
+        activation_q8_staging.resize(blocks);
+        const hipStream_t stream = weights.stream();
+        if (!hip_result(
+                hipMemcpyAsync(activation_q8_staging.data(), device_values,
+                               blocks * sizeof(block_q8_K), hipMemcpyDeviceToHost,
+                               stream),
+                "copy GPU Q8 debug activation", error) ||
+            !hip_result(hipStreamSynchronize(stream),
+                        "synchronize GPU Q8 debug activation", error))
+            return false;
+        activation_staging.resize(elements);
+        for (size_t block = 0; block < blocks; block++)
+            for (size_t index = 0; index < QK_K; index++)
+                activation_staging[block * QK_K + index] =
+                    activation_q8_staging[block].d *
+                    activation_q8_staging[block].qs[index];
+        return write_activation_record(what, layer, elements, error);
     }
 
     void clear_pending_profile() {
@@ -766,6 +803,9 @@ struct GpuEngine::Impl {
                               error);
         if (!gathered) return false;
         if (!profile_end(profile_record, error)) return false;
+        if (!dump_activation("model.input_embed", -1, buffers.hidden,
+                             config.n_embd, position, error))
+            return false;
 
         const size_t conv_per_layer =
             (size_t)(config.ssm_conv_kernel - 1) * config.gdn_qkv_dim();
@@ -779,6 +819,7 @@ struct GpuEngine::Impl {
         bool final_norm_ready = false;
         for (uint32_t layer = 0; layer < config.n_layer_main; layer++) {
             const GpuLayerWeights& item = layers[layer];
+            bool attention_norm_f32_ready = attention_norm_ready;
             if (!attention_norm_ready) {
                 float* attention_normalized_output = buffers.normalized;
                 if (options.integer_gemv && item.is_attention &&
@@ -795,8 +836,16 @@ struct GpuEngine::Impl {
                     return set_layer_error(layer, "attention norm/quantize", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "attention norm profile", error);
+                attention_norm_f32_ready = attention_normalized_output != nullptr;
             }
             attention_norm_ready = false;
+            const bool attention_norm_dumped = attention_norm_f32_ready
+                ? dump_activation("attn_norm", layer, buffers.normalized,
+                                  config.n_embd, position, error)
+                : dump_q8_activation("attn_norm", layer, buffers.q8,
+                                     config.n_embd, position, error);
+            if (!attention_norm_dumped)
+                return set_layer_error(layer, "attention norm dump", error);
             bool post_norm_ready = false;
             float* const ffn_normalized_output =
                 options.integer_gemv &&
@@ -960,6 +1009,18 @@ struct GpuEngine::Impl {
                     if (!profile_end(profile_record, error))
                         return set_layer_error(layer, "K1c profile", error);
                 }
+                if (!dump_activation("linear_attn_qkv_mixed", layer,
+                                     buffers.gdn_mixed,
+                                     config.gdn_qkv_dim(), position, error) ||
+                    !dump_activation("z", layer, buffers.gdn_z,
+                                     config.ssm_inner_size, position, error) ||
+                    !dump_activation("alpha", layer, buffers.alpha,
+                                     config.ssm_time_step_rank, position,
+                                     error) ||
+                    !dump_activation("beta", layer, buffers.beta,
+                                     config.ssm_time_step_rank, position,
+                                     error))
+                    return set_layer_error(layer, "GDN projection dump", error);
                 const size_t conv_offset =
                     (size_t)item.state_index * conv_per_layer;
                 const size_t ssm_offset =
@@ -1029,6 +1090,9 @@ struct GpuEngine::Impl {
                     return set_layer_error(layer, "K3b profile", error);
             }
 
+            if (!dump_activation("attn_residual", layer, buffers.hidden,
+                                 config.n_embd, position, error))
+                return set_layer_error(layer, "attention residual dump", error);
             if (!post_norm_ready) {
                 if (!profile_begin(item.is_attention ? "A4a FFN norm+Q8"
                                                      : "K4a FFN norm+Q8",
@@ -1040,6 +1104,14 @@ struct GpuEngine::Impl {
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "FFN norm profile", error);
             }
+            const bool post_norm_dumped = ffn_normalized_output
+                ? dump_activation("attn_post_norm", layer,
+                                  ffn_normalized_output, config.n_embd,
+                                  position, error)
+                : dump_q8_activation("attn_post_norm", layer, buffers.q8,
+                                     config.n_embd, position, error);
+            if (!post_norm_dumped)
+                return set_layer_error(layer, "FFN norm dump", error);
             const bool fused_integer_ffn = options.integer_gemv &&
                 gpu_gemv_q8_K_pair_activate_supported(*item.ffn_gate,
                                                       *item.ffn_up);

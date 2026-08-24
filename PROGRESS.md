@@ -2337,3 +2337,154 @@ existing eval callback so `--generate` can dump the actual generated-position
 logits/activations after batched prompt prefill, then bisect the shared generation-
 166 state against the GPU trace. Do not search reduction permutations or weaken
 the 256-token identity requirement.
+
+---
+
+## 2026-08-25 — Session 20 (Stage 2 G2a generated-state bisect, GPT-5.6 Sol)
+
+**G2a remains red and production arithmetic is unchanged.** The requested
+generated-state oracle and expanded GPU activation boundaries now work, and they
+narrow the generation-166 fork to smooth numerical drift beginning in layer 0.
+Several evidence-led Q8_0 execution candidates extended the greedy prefix as far
+as 189 tokens, but the best one failed the immutable teacher-forced cosine floor
+and was completely rolled back.
+
+### 1. Real generated-state oracle
+
+`tools/oracle_activations` now supports batched prompt prefill followed by greedy
+decode, absolute-position activation capture, raw generated-token output, and a
+comma-separated callback filter. Its old stepwise mode was regression-checked:
+the position-12 activation file remained bit-identical with SHA-256
+`3458f5fba59318702f9c945d932aec7cb586aad25ca7093a0567bce884a41b0e`.
+
+The actual generation-166 reference state was captured with:
+
+```bash
+./build/release/tools/oracle_activations -m MODEL -t "$P1_FIRST_12" \
+  --batched --generate 167 --pos 177 \
+  --filter "model.input_embed,attn_norm,final_output,attn_residual,attn_post_norm,l_out" \
+  --dump-tokens /tmp/oracle-batch-gen167.tokens.bin \
+  -o /tmp/oracle-batch-pos177.bin
+```
+
+It regenerated token **7752** at generation 166. The complete 167-token file is
+bit-identical to the Session 19 oracle with SHA-256
+`f866b006670050532d75eb054ae1456cdfa8f246159375b1adecd54a128bdb90`.
+
+### 2. Expanded GPU boundary bisect
+
+`ns gpu-eval --dump-activations` now records the exact callback names needed for
+the bisect: `model.input_embed`, `attn_norm-N`, `final_output-N`,
+`linear_attn_qkv_mixed-N`, `z-N`, `alpha-N`, `beta-N`, `attn_residual-N`,
+`attn_post_norm-N`, and `l_out-N`. Integer-only normalization buffers are copied
+as exact Q8_K blocks and host-dequantized for the diagnostic file. All extra work
+is behind the existing activation-file/position guard; normal graph execution is
+unchanged.
+
+At absolute position 177 on the 166-token shared batched path:
+
+| boundary | cosine | max abs | observation |
+|---|---:|---:|---|
+| `model.input_embed` | **1.00000000** | **0** | bit-identical |
+| `attn_norm-0` | **1.00000000** | **0** | bit-identical |
+| `final_output-0` | **1.00000000** | 0.0000923 | GDN output essentially exact |
+| `attn_residual-0` | 0.99999539 | 0.004795 | first material error, row 3994 |
+| `l_out-0` | 0.99999480 | 0.018187 | FFN amplifies the same local error |
+| `l_out-63` | 0.99948692 | 1.00688 | smooth accumulated drift |
+
+The input embedding and layer-0 input norm therefore rule out token-row gather,
+prompt/decode indexing, and the incoming residual. The trace has no structural
+layer jump. Coordinate 3994 becomes the largest error repeatedly from the layer-0
+residual onward.
+
+### 3. Q8_0 residual experiment — rejected
+
+`blk.0.ssm_out.weight` is Q8_0. The pinned llama.cpp CPU path quantizes its input
+to Q8_0, while production ns intentionally uses its existing fp32-dequant path.
+A bounded diagnostic implemented the x86 contract exactly: fp16 Q8_0 activation
+scales, signed int8 dot products, eight fp32 FMA lanes, and the AVX2 horizontal
+reduction tree.
+
+A host row probe using the real position-200 activation files reproduced all
+5,120 GPU and oracle `attn_residual-0` values bit-for-bit from their respective
+`final_output-0` vectors and the exact GGUF row bits. The Q8 implementation itself
+was therefore validated, not inferred from token output.
+
+The candidate results were:
+
+| Q8_0 scope | complete-path prefix |
+|---|---:|
+| all five Q8_0 residual matrices | 9 tokens vs llama-batch |
+| layer 0 only | **189 tokens vs llama-step** |
+| layer 0 + layer 4 | 137 tokens vs llama-step |
+| layer 0 + layer 7 | 96 tokens vs llama-step |
+| layer 0 + layer 9 | 137 tokens vs llama-step |
+| layer 0 + layer 63 | 189 tokens vs llama-step |
+
+Layer 0 alone improved `l_out-0` at position 12 from 0.99999206 cosine /
+0.036287 max error to **0.99999915 / 0.014292**, and at position 200 reached
+**0.99999980 / 0.001470**. The full 256-token continuation still forked at
+generation 189: ns chose token 6635 at logit 23.2171 while llama-step chose token
+1262 at 23.2609.
+
+More importantly, the unchanged 205-row teacher gate rejected it:
+
+| prompt | rows | triangulated | ns worst cosine | control worst |
+|---|---:|---:|---:|---:|
+| p1 | 31 | 31/31 | 0.99951230 | 0.99947041 |
+| p2 | 90 | 90/90 | **0.90691723** | **0.91065207** |
+| p3 | 54 | 54/54 | 0.99850333 | 0.99782369 |
+| p4 | 30 | 30/30 | 0.94910766 | 0.99955665 |
+
+Aggregate triangulated top-1 was 205/205, mean cosine 0.99852709, worst cosine
+0.90691723, and top-5 overlap 0.9629, but the control-derived cosine floor is a
+hard gate. The candidate is RED and every Q8_0 execution change was removed.
+
+### 4. GDN control projection experiment — rejected
+
+The new layer-0 projection trace found QKV and z almost exact (both max difference
+`2.86102e-06`), while the Q8_0 alpha and beta projections differed by 0.0140529
+and 0.00752807. Evaluating alpha/beta with the verified Q8_0 contract made both
+vectors bit-identical and reduced `final_output-0` max error to `9.14186e-06`.
+It did not improve the whole-path gate:
+
+- alpha+beta together followed llama-step for 96 tokens;
+- alpha alone followed llama-batch for 126 tokens;
+- beta alone followed llama-batch for 8 tokens.
+
+All three are worse than the restored 166-token production path. The alpha/beta
+execution changes and unused Q8_0 kernels/buffers were removed.
+
+### 5. Cleanup and verification
+
+After rollback, the production 167-token repro is byte-identical to Session 19:
+
+```text
+ec7e3a33db9c58536172598cbf000c75e2f1d53d888e72b49e32424025b619aa
+```
+
+Commands:
+
+```bash
+git diff --check
+make -j4 test bench
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS;
+benchmark binaries build. Every HIP compile used `--offload-arch=gfx1201`
+exactly. The 43 MiB evidence bundle is preserved at:
+
+```text
+~/.cache/neutron-star/g2a-q5-divergence/session20/
+```
+
+**ESCALATE / NEXT:** G2a is still the sole red Stage-2 condition after three
+consecutive localization sessions; Stage 3 remains blocked. The generated-state
+trace shows smooth backend arithmetic drift, not a structural defect, and all
+bounded Q8_0 semantic variants either shorten the complete-path prefix or violate
+the teacher cosine floor. Per PLAN Part 0, stop blind arithmetic work and move to
+a parallel Stage-2 task. Keep the new deterministic generated-state repro and
+boundary captures available for a future evidence-led hypothesis; do not weaken
+the 256-token identity gate.
