@@ -82,6 +82,10 @@ $(BUILDDIR)/gdn_bench: bench/gdn_bench.hip $(filter-out $(BUILDDIR)/src/main.cpp
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) -o $@
 
+$(BUILDDIR)/attention_bench: bench/attention_bench.hip $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS))
+	@mkdir -p $(dir $@)
+	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) -o $@
+
 $(BUILDDIR)/%: bench/%.hip
 	@mkdir -p $(dir $@)
 	$(HIPCC) $(FLAGS) $< -o $@

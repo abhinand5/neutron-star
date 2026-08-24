@@ -1945,3 +1945,122 @@ gap with kernel-level timing rather than more blind geometry sweeps. Re-run both
 formal G2b commands after any change. G2a's preserved minimal repro is escalated;
 return to it only with a new oracle/numerics hypothesis. Do not begin Stage 3 while
 either G2a or G2b is red.
+
+---
+
+## 2026-08-24 — Session 17 (Stage 2 G2b: both 32K retention gates green, GPT-5.6 Sol)
+
+**Both G2b depth-32768 retention sub-gates are now green.** An honest A2 stage
+profiler localized the remaining cost to serial finalize statistics. Parallelizing
+that reduction raises Q4 from 30.101 to **30.478 ± 0.030 t/s** and Q5 from 26.650
+to **26.863 ± 0.014 t/s**. Overall G2 remains red: G2a Q5 is escalated, and the
+latest Q5 depth-0 reruns remain marginally below the literal 30 t/s absolute floor.
+
+### 1. Honest long-A2 stage profiler
+
+`bench/attention_bench.hip` uses the guarded model loader and round-robins eight
+distinct capacity-32769 fp16 K/V banks: **1.074 GB** total, safely above the 1 GB
+rule. A diagnostic-only host entry point records HIP events around prepare, tile,
+and finalize; production forward continues to call the unchanged asynchronous
+`gpu_attention_step` interface.
+
+```bash
+make -j4 build/release/attention_bench
+./build/release/attention_bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf 5
+./build/release/attention_bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf 5 --no-q8
+```
+
+Initial 40-sample profile:
+
+| stage | mean us/layer | range us | evidence |
+|---|---:|---:|---|
+| prepare | 10.961 | 9.560–11.680 | 3.6% of A2 |
+| tiles | 248.478 | 225.720–266.520 | **540.2 GB/s** fp16 KV |
+| finalize | **41.355** | 37.080–44.400 | 13.7% of A2 |
+| total | **300.794** | — | **4.813 ms/token** over 16 layers |
+
+`--no-q8` left finalize unchanged at 40.744 us, proving the exact Q8 handoff was
+not the cost. One thread was serially reading 65 maxima, evaluating 65 `expf`s,
+and accumulating 65 sums while the other 255 threads waited.
+
+### 2. Parallel 128-thread finalize
+
+- Scratch is now `[q_head][tile][dim]`, keeping a head's partials together.
+- A 128-thread block merges one float2 per thread. All tile maxima, scales, and
+  weighted sums are wave/block reduced instead of serialized in thread 0.
+- Exact Q8_K output is produced from two adjacent values per thread. Max magnitude
+  plus lowest global index is unchanged; each 16-value `bsums` group remains an
+  exact integer sum.
+- Final resources: tile kernel **49 VGPR / 28 SGPR / 8192 B LDS**; finalize
+  **25 VGPR / 24 SGPR / 52 B LDS**; neither spills.
+
+The final 40-sample diagnostic result was:
+
+```text
+prepare    11.658 us
+tiles     251.010 us, 534.7 GB/s
+finalize   21.903 us
+total     284.571 us/layer = 4.553 ms/token over 16 layers
+```
+
+Finalize falls by **19.452 us/layer**, worth about **0.311 ms/token** across the
+16 attention layers. The literal three-tile CPU oracle remains green at maximum
+error **5.51e-7**; K cache is within one fp16 step, V bits are exact, and Q8_K is
+byte-identical.
+
+### 3. Formal G2b depth-32768 results
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 32768 \
+  --jsonl /tmp/ns-q4-session17-formal-depth32768.jsonl
+
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 32768 \
+  --jsonl /tmp/ns-q5-session17-formal-depth32768.jsonl
+```
+
+| model | run t/s | mean ± population SD | ms/token | vs accepted depth 0 | retention |
+|---|---|---:|---:|---:|---|
+| Q4_K_XL | 30.500, 30.497, 30.436 | **30.478 ± 0.030** | **32.811** | **88.18%** of 34.564 | **GREEN**, need 30.416 |
+| Q5_K_XL | 26.876, 26.870, 26.844 | **26.863 ± 0.014** | **37.226** | **89.53%** of 30.004 | **GREEN**, need 26.404 |
+
+One Q5 invocation was terminated before model load completed after an unrelated
+host/driver stall and produced no timed sample; it was discarded. The clean rerun
+above is the only Session-17 Q5 JSONL entry.
+
+### 4. Correctness and build verification
+
+```bash
+git diff --check
+make -j4 test bench
+./build/release/tests/test_repack && \
+  python3 tests/test_compare_gate.py && \
+  python3 tests/test_compare_tokens.py
+```
+
+No whitespace errors. All benchmark binaries build. `test_gguf`,
+`test_gpu_attention`, `test_gpu_forward`, `test_gpu_gdn`, `test_gpu_gemv`,
+`test_gpu_ops`, `test_gpu_upload`, `test_quants`, `test_repack`,
+`test_compare_gate.py`, and `test_compare_tokens.py` PASS. The aggregate make was
+interrupted while `test_repack` was running after all earlier tests passed; the
+standalone tail then completed **122,473 repack checks** across both blessed GGUFs
+and both Python gate suites passed. Every HIP compile line used
+`--offload-arch=gfx1201` exactly.
+
+### 5. Rejected follow-ups (rolled back)
+
+- Head-major scratch with the old serial finalize saved only ~4 us/layer because
+  serial tile statistics, not Q8 or partial-output bandwidth, dominated.
+- `__expf` for parallel finalize tile scales was numerically green but did not
+  improve total A2; exact `expf` is retained.
+- Restoring the pre-long-path 96-byte short kernel argument block measured 29.997
+  t/s and was reverted. The depth-0 edge is not caused by scratch arguments.
+
+**NEXT:** Keep Stage 2/G2 red. The performance work has cleared both 32K retention
+sub-gates, but Q5 needs a robust literal >=30 t/s depth-0 result and G2a's preserved
+exact-greedy/cosine repro remains escalated. Do not enter Stage 3.

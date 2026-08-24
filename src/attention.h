@@ -48,16 +48,29 @@ struct AttentionStepArgs {
     // Reusable long-context scratch. Required only when capacity exceeds
     // ATTENTION_LONG_CONTEXT_MIN_CAPACITY; one set is shared by all layers.
     float* query_scratch = nullptr;  // [24][256]
-    float* tile_max = nullptr;       // [ceil(capacity/tile)][24]
-    float* tile_sum = nullptr;       // [ceil(capacity/tile)][24]
-    float* tile_output = nullptr;    // [ceil(capacity/tile)][24][256]
+    float* tile_max = nullptr;       // [24][ceil(capacity/tile)]
+    float* tile_sum = nullptr;       // [24][ceil(capacity/tile)]
+    float* tile_output = nullptr;    // [24][ceil(capacity/tile)][256]
     const int32_t* step_control = nullptr; // optional [token, position, n_past]
     int n_past = 0;
     int capacity = 0;
     int position = 0;
 };
 
+struct AttentionKernelProfile {
+    double prepare_us = 0.0;
+    double tiles_us = 0.0;
+    double finalize_us = 0.0;
+};
+
 bool gpu_attention_step(const AttentionStepArgs& args, hipStream_t stream,
                         std::string* error = nullptr);
+
+// Diagnostic-only synchronized launch timing for the long-context path.
+// Production forward execution always uses gpu_attention_step above.
+bool gpu_attention_step_profiled(const AttentionStepArgs& args,
+                                 hipStream_t stream,
+                                 AttentionKernelProfile* profile,
+                                 std::string* error = nullptr);
 
 }  // namespace ns

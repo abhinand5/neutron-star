@@ -421,7 +421,11 @@ void attention_tiles_long_kernel(AttentionStepArgs args) {
         __syncthreads();
     }
     if (!active_head) return;
-    const size_t tile_head = (size_t)tile * ATTENTION_Q_HEADS + q_head;
+    const int scratch_tiles =
+        (args.capacity + ATTENTION_SEQUENCE_TILE - 1) /
+        ATTENTION_SEQUENCE_TILE;
+    const size_t tile_head =
+        (size_t)q_head * scratch_tiles + tile;
     float2* tile_output = reinterpret_cast<float2*>(
         args.tile_output + tile_head * ATTENTION_HEAD_DIM);
 #pragma unroll
@@ -433,50 +437,160 @@ void attention_tiles_long_kernel(AttentionStepArgs args) {
     }
 }
 
-__global__ __launch_bounds__(256)
+__global__ __launch_bounds__(128)
 void attention_finalize_long_kernel(AttentionStepArgs args) {
-    __shared__ float values[ATTENTION_HEAD_DIM];
-    __shared__ float wave_maxima[8];
-    __shared__ int wave_indices[8];
+    __shared__ float wave_maxima[4];
+    __shared__ float wave_values[4];
+    __shared__ int wave_indices[4];
     __shared__ float inverse_softmax_sum;
     const int q_head = (int)blockIdx.x;
-    const int dim = (int)threadIdx.x;
+    const int pair = (int)threadIdx.x;
+    const int first_dim = 2 * pair;
+    const int lane = pair & 31;
+    const int wave = pair >> 5;
     const int n_past = args.step_control ? args.step_control[2] : args.n_past;
     const int tile_count =
         (n_past + ATTENTION_SEQUENCE_TILE) / ATTENTION_SEQUENCE_TILE;
-    if (dim == 0) {
-        float maximum = -INFINITY;
-        for (int tile = 0; tile < tile_count; tile++) {
-            const size_t tile_head =
-                (size_t)tile * ATTENTION_Q_HEADS + q_head;
-            maximum = fmaxf(maximum, args.tile_max[tile_head]);
-        }
-        float sum = 0.0f;
-        for (int tile = 0; tile < tile_count; tile++) {
-            const size_t tile_head =
-                (size_t)tile * ATTENTION_Q_HEADS + q_head;
-            const float scale = expf(args.tile_max[tile_head] - maximum);
-            args.tile_max[tile_head] = scale;
-            sum = fmaf(args.tile_sum[tile_head], scale, sum);
-        }
-        inverse_softmax_sum = 1.0f / sum;
+    const int scratch_tiles =
+        (args.capacity + ATTENTION_SEQUENCE_TILE - 1) /
+        ATTENTION_SEQUENCE_TILE;
+    const size_t pair_tile_head =
+        (size_t)q_head * scratch_tiles + pair;
+    float tile_maximum = pair < tile_count
+        ? args.tile_max[pair_tile_head] : -INFINITY;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        tile_maximum = fmaxf(
+            tile_maximum, __shfl_down(tile_maximum, offset, 32));
+    if (lane == 0) wave_maxima[wave] = tile_maximum;
+    __syncthreads();
+    if (wave == 0) {
+        tile_maximum = lane < 4 ? wave_maxima[lane] : -INFINITY;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            tile_maximum = fmaxf(
+                tile_maximum, __shfl_down(tile_maximum, offset, 32));
+        if (lane == 0) wave_maxima[0] = tile_maximum;
     }
     __syncthreads();
-    float accumulator = 0.0f;
+    float weighted_sum = 0.0f;
+    if (pair < tile_count) {
+        const float scale =
+            expf(args.tile_max[pair_tile_head] - wave_maxima[0]);
+        args.tile_max[pair_tile_head] = scale;
+        weighted_sum = args.tile_sum[pair_tile_head] * scale;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        weighted_sum += __shfl_down(weighted_sum, offset, 32);
+    if (lane == 0) wave_values[wave] = weighted_sum;
+    __syncthreads();
+    if (wave == 0) {
+        weighted_sum = lane < 4 ? wave_values[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            weighted_sum += __shfl_down(weighted_sum, offset, 32);
+        if (lane == 0) inverse_softmax_sum = 1.0f / weighted_sum;
+    }
+    __syncthreads();
+    float2 accumulator = {};
     for (int tile = 0; tile < tile_count; tile++) {
         const size_t tile_head =
-            (size_t)tile * ATTENTION_Q_HEADS + q_head;
-        accumulator = fmaf(
-            args.tile_output[tile_head * ATTENTION_HEAD_DIM + dim],
-            args.tile_max[tile_head], accumulator);
+            (size_t)q_head * scratch_tiles + tile;
+        const float2 value = reinterpret_cast<const float2*>(
+            args.tile_output + tile_head * ATTENTION_HEAD_DIM)[pair];
+        const float scale = args.tile_max[tile_head];
+        accumulator.x = fmaf(value.x, scale, accumulator.x);
+        accumulator.y = fmaf(value.y, scale, accumulator.y);
     }
     const int qg_base = q_head * 2 * ATTENTION_HEAD_DIM;
-    const float gate = args.qg[qg_base + ATTENTION_HEAD_DIM + dim];
-    const float gated = accumulator * inverse_softmax_sum /
-                        (1.0f + expf(-gate));
-    args.gated_output[q_head * ATTENTION_HEAD_DIM + dim] = gated;
-    store_attention_q8(gated, q_head, args.q8_output, values, wave_maxima,
-                       wave_indices);
+    const float2 gate = reinterpret_cast<const float2*>(
+        args.qg + qg_base + ATTENTION_HEAD_DIM)[pair];
+    float2 gated;
+    gated.x = accumulator.x * inverse_softmax_sum /
+              (1.0f + expf(-gate.x));
+    gated.y = accumulator.y * inverse_softmax_sum /
+              (1.0f + expf(-gate.y));
+    reinterpret_cast<float2*>(
+        args.gated_output + q_head * ATTENTION_HEAD_DIM)[pair] = gated;
+    if (!args.q8_output) return;
+
+    float maximum = fabsf(gated.x);
+    float winner_value = gated.x;
+    int maximum_index = first_dim;
+    const float second_maximum = fabsf(gated.y);
+    if (second_maximum > maximum) {
+        maximum = second_maximum;
+        winner_value = gated.y;
+        maximum_index = first_dim + 1;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_down(maximum, offset, 32);
+        const float other_value = __shfl_down(winner_value, offset, 32);
+        const int other_index = __shfl_down(maximum_index, offset, 32);
+        if (lane < offset &&
+            (other > maximum ||
+             (other == maximum && other_index < maximum_index))) {
+            maximum = other;
+            winner_value = other_value;
+            maximum_index = other_index;
+        }
+    }
+    if (lane == 0) {
+        wave_maxima[wave] = maximum;
+        wave_values[wave] = winner_value;
+        wave_indices[wave] = maximum_index;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        maximum = lane < 4 ? wave_maxima[lane] : -1.0f;
+        winner_value = lane < 4 ? wave_values[lane] : 0.0f;
+        maximum_index = lane < 4 ? wave_indices[lane] : ATTENTION_HEAD_DIM;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down(maximum, offset, 32);
+            const float other_value = __shfl_down(winner_value, offset, 32);
+            const int other_index = __shfl_down(maximum_index, offset, 32);
+            if (lane < offset &&
+                (other > maximum ||
+                 (other == maximum && other_index < maximum_index))) {
+                maximum = other;
+                winner_value = other_value;
+                maximum_index = other_index;
+            }
+        }
+        if (lane == 0) {
+            wave_maxima[0] = maximum;
+            wave_values[0] = maximum == 0.0f
+                ? 0.0f : __fdiv_rn(-127.0f, winner_value);
+        }
+    }
+    __syncthreads();
+
+    block_q8_K& block = args.q8_output[q_head];
+    if (wave_maxima[0] == 0.0f) {
+        block.qs[first_dim] = 0;
+        block.qs[first_dim + 1] = 0;
+        if ((pair & 7) == 0) block.bsums[pair / 8] = 0;
+        if (pair == 0) block.d = 0.0f;
+        return;
+    }
+    const float inverse_scale = wave_values[0];
+    int first_quant = nearest_integer(__fmul_rn(inverse_scale, gated.x));
+    int second_quant = nearest_integer(__fmul_rn(inverse_scale, gated.y));
+    if (first_quant > 127) first_quant = 127;
+    if (second_quant > 127) second_quant = 127;
+    block.qs[first_dim] = (int8_t)first_quant;
+    block.qs[first_dim + 1] = (int8_t)second_quant;
+    int group_sum = first_quant + second_quant;
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        const int other = __shfl_down(group_sum, offset, 8);
+        if ((lane & 7) < offset) group_sum += other;
+    }
+    if ((pair & 7) == 0) block.bsums[pair / 8] = (int16_t)group_sum;
+    if (pair == 0) block.d = __fdiv_rn(1.0f, inverse_scale);
 }
 
 bool hip_result(hipError_t result, const char* operation, std::string* error) {
@@ -523,9 +637,102 @@ bool gpu_attention_step(const AttentionStepArgs& args, hipStream_t stream,
     if (!hip_result(hipGetLastError(), "launch long attention tiles", error))
         return false;
     hipLaunchKernelGGL(attention_finalize_long_kernel,
+                       dim3(ATTENTION_Q_HEADS),
+                       dim3(ATTENTION_HEAD_DIM / 2), 0, stream, args);
+    return hip_result(hipGetLastError(), "launch long attention finalize", error);
+}
+
+bool gpu_attention_step_profiled(const AttentionStepArgs& args,
+                                 hipStream_t stream,
+                                 AttentionKernelProfile* profile,
+                                 std::string* error) {
+    if (!profile || !stream || !args.qg || !args.k || !args.v ||
+        !args.q_norm || !args.k_norm || !args.k_cache || !args.v_cache ||
+        !args.gated_output || args.k_cache == args.v_cache ||
+        args.capacity <= ATTENTION_LONG_CONTEXT_MIN_CAPACITY ||
+        !args.query_scratch || !args.tile_max || !args.tile_sum ||
+        !args.tile_output ||
+        (!args.step_control &&
+         (args.n_past < 0 || args.n_past >= args.capacity ||
+          args.position < 0))) {
+        if (error) *error = "invalid profiled long-context A2 arguments";
+        return false;
+    }
+
+    hipEvent_t markers[4] = {};
+    auto destroy_markers = [&]() {
+        for (hipEvent_t marker : markers) {
+            if (marker) {
+                const hipError_t ignored = hipEventDestroy(marker);
+                (void)ignored;
+            }
+        }
+    };
+    for (hipEvent_t& marker : markers) {
+        if (!hip_result(hipEventCreate(&marker), "create A2 profile event",
+                        error)) {
+            destroy_markers();
+            return false;
+        }
+    }
+    if (!hip_result(hipEventRecord(markers[0], stream),
+                    "record A2 profile start", error)) {
+        destroy_markers();
+        return false;
+    }
+
+    hipLaunchKernelGGL(attention_prepare_long_kernel,
                        dim3(ATTENTION_Q_HEADS), dim3(ATTENTION_HEAD_DIM), 0,
                        stream, args);
-    return hip_result(hipGetLastError(), "launch long attention finalize", error);
+    if (!hip_result(hipGetLastError(), "launch profiled attention prepare",
+                    error) ||
+        !hip_result(hipEventRecord(markers[1], stream),
+                    "record A2 prepare stop", error)) {
+        destroy_markers();
+        return false;
+    }
+
+    const int tiles = attention_sequence_tiles(args.capacity);
+    hipLaunchKernelGGL(attention_tiles_long_kernel,
+                       dim3((uint32_t)(ATTENTION_KV_HEADS * tiles)),
+                       dim3(ATTENTION_HEAD_DIM), 0, stream, args);
+    if (!hip_result(hipGetLastError(), "launch profiled attention tiles",
+                    error) ||
+        !hip_result(hipEventRecord(markers[2], stream),
+                    "record A2 tiles stop", error)) {
+        destroy_markers();
+        return false;
+    }
+
+    hipLaunchKernelGGL(attention_finalize_long_kernel,
+                       dim3(ATTENTION_Q_HEADS),
+                       dim3(ATTENTION_HEAD_DIM / 2), 0, stream, args);
+    if (!hip_result(hipGetLastError(), "launch profiled attention finalize",
+                    error) ||
+        !hip_result(hipEventRecord(markers[3], stream),
+                    "record A2 finalize stop", error) ||
+        !hip_result(hipEventSynchronize(markers[3]),
+                    "synchronize A2 profile", error)) {
+        destroy_markers();
+        return false;
+    }
+
+    float prepare_ms = 0.0f;
+    float tiles_ms = 0.0f;
+    float finalize_ms = 0.0f;
+    const bool elapsed_ok =
+        hip_result(hipEventElapsedTime(&prepare_ms, markers[0], markers[1]),
+                   "read A2 prepare time", error) &&
+        hip_result(hipEventElapsedTime(&tiles_ms, markers[1], markers[2]),
+                   "read A2 tiles time", error) &&
+        hip_result(hipEventElapsedTime(&finalize_ms, markers[2], markers[3]),
+                   "read A2 finalize time", error);
+    destroy_markers();
+    if (!elapsed_ok) return false;
+    profile->prepare_us = prepare_ms * 1000.0;
+    profile->tiles_us = tiles_ms * 1000.0;
+    profile->finalize_us = finalize_ms * 1000.0;
+    return true;
 }
 
 }  // namespace ns
