@@ -2488,3 +2488,127 @@ the teacher cosine floor. Per PLAN Part 0, stop blind arithmetic work and move t
 a parallel Stage-2 task. Keep the new deterministic generated-state repro and
 boundary captures available for a future evidence-led hypothesis; do not weaken
 the 256-token identity gate.
+
+---
+
+## 2026-08-25 — Session 21 (Stage 2 G2a reproducible gate workflow; paused checkpoint, GPT-5.6 Sol)
+
+**The repository is saved at a clean parallel-task checkpoint; production model
+arithmetic is unchanged.** G2a remains RED solely because Q5's 256-token greedy
+continuation matches neither complete reference path. Stage 3 remains blocked.
+
+### 1. One-command G2a workflow
+
+Added `tools/gate_g2a.py` and the `make gate-g2a` target. The workflow encodes the
+complete correctness contract instead of relying on commands reconstructed from
+old session notes:
+
+- both blessed GGUF filenames and exact byte sizes;
+- the four committed prompts and their exact 31/90/54/30 row counts (205 total);
+- D6/D8/D9 teacher comparison against both pinned llama CPU paths;
+- p1's first 12 tokens followed by exactly 256 autoregressive tokens;
+- whole-path equality to stepwise **or** batched reference, never token weaving;
+- pinned llama.cpp commit `3cb7ffb1a1f612d5e4a46244ae5a3c77ad934a70`
+  and a clean oracle checkout;
+- exact reference/output byte-count checks, atomic artifact publication, command
+  logs, binary/source identity, and SHA-256 evidence records;
+- `--prepare-oracles` for missing expensive references, `--hash-models` for full
+  GGUF fingerprints, and a non-mutating `--dry-run`.
+
+Every run writes `manifest.json` before work begins and checkpoints command state
+before and after each subprocess. SIGTERM/SIGINT now terminates the active child,
+marks the command and run `INTERRUPTED`, and preserves a resumable record. A
+regression test covers prompt/count invariants, exact command construction, artifact
+size rejection, and incremental manifest persistence. `GUIDE.md` documents the
+formal invocation:
+
+```bash
+make gate-g2a G2A_ARGS="--models q4 q5 --prepare-oracles --hash-models"
+```
+
+### 2. Real Q5 workflow replay
+
+The new harness was exercised against all preserved Q5 references:
+
+```bash
+make -j4 build/release/ns build/release/tools/oracle_logits
+python3 tools/gate_g2a.py --models q5
+```
+
+It completed seven commands in 91.62 seconds and reproduced Session 19 exactly:
+
+| check | measured result | verdict |
+|---|---:|---:|
+| teacher top-1 raw | 203/205 = 0.9902 | diagnostic |
+| teacher top-1 triangulated | **205/205 = 1.0000** | GREEN |
+| teacher mean cosine | **0.99960868** | GREEN |
+| teacher worst cosine | **0.99716446** vs 0.91065207 control floor | GREEN |
+| teacher top-5 overlap | **0.9727** | GREEN |
+| p1 greedy vs stepwise | first mismatch generation 1 | RED |
+| p1 greedy vs batched | first mismatch generation **166** | RED |
+
+The Q5 run is preserved at:
+
+```text
+~/.cache/neutron-star/g2a-gate/runs/20260824T192852Z-6e5d39fe6849/
+```
+
+Its status is `RED`, all five engine commands exited 0, teacher comparison exited
+0, and greedy comparison exited 1. The directory is 195 MiB and contains 15 hashed
+evidence artifacts. Current greedy SHA-256 is
+`7a3281fd9338c71143bbed7be194936c21c781a192158f7a41e718db0d303bdf`.
+
+### 3. Q4 256-token evidence gap and interruption state
+
+The Q4 dry run proved all eight 205-row teacher references are already present and
+correctly sized in `~/.cache/neutron-star/parity-205/`. The two Q4 256-token greedy
+references were the only missing artifacts. Preparation began with:
+
+```bash
+python3 tools/gate_g2a.py --models q4 --prepare-oracles
+```
+
+The user requested a pause while the first stepwise CPU oracle was still running.
+Processes 97076/97064 were terminated after approximately 1 minute 53 seconds. The
+oracle writes generated IDs only after completion, so it produced **no partial or
+reusable Q4 token file**; `~/.cache/neutron-star/greedy-256-q4/` remains empty. The
+interrupted 4 KiB record is explicitly marked `INTERRUPTED` at:
+
+```text
+~/.cache/neutron-star/g2a-gate/runs/20260824T193237Z-6e5d39fe6849/
+```
+
+No gate inference is made from the interrupted run.
+
+### 4. Verification
+
+Commands run after the workflow implementation:
+
+```bash
+python3 -m py_compile tools/gate_g2a.py tests/test_gate_g2a.py
+python3 tests/test_gate_g2a.py
+python3 tools/gate_g2a.py --models q5 --dry-run
+git diff --check
+PYTHONDONTWRITEBYTECODE=1 make -j4 test bench
+PYTHONDONTWRITEBYTECODE=1 make gate-g2a G2A_ARGS="--models q4 --dry-run"
+PYTHONDONTWRITEBYTECODE=1 python3 tests/test_gate_g2a.py
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, `test_compare_tokens.py`, and the new
+`test_gate_g2a.py` all PASS; benchmark binaries build. Every HIP compile used
+`--offload-arch=gfx1201` exactly.
+
+**NEXT (resume here):** run
+
+```bash
+make gate-g2a G2A_ARGS="--models q4 --prepare-oracles"
+```
+
+This will create the two missing Q4 256-token CPU references and then perform the
+complete current-GPU Q4 gate. Preserve the resulting manifest. Afterward, rerun
+both models with `--models q4 q5 --hash-models` for one formal combined record.
+Expect the combined gate to remain RED unless Q5 arithmetic has changed: its
+teacher half is green but its greedy path still forks at generation 166. Do not
+start Stage 3 or resume blind Q5 arithmetic experiments while this gate is red.

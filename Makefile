@@ -50,7 +50,7 @@ else
 all: $(NS)
 endif
 
-.PHONY: all bench test tools debug clean help
+.PHONY: all bench test tools gate-g2a debug clean help
 debug:
 	@$(MAKE) --no-print-directory MODE=debug all bench test
 
@@ -127,6 +127,12 @@ $(BUILDDIR)/tools/%: tools/%.cpp $(filter-out $(BUILDDIR)/src/main.cpp.o,$(OBJS)
 	$(HIPCC) $(FLAGS) $< -x none $(filter %.o,$^) \
 	  -L$(GGML_LIBDIR) -lggml-cpu -lggml-base -Wl,-rpath,$(GGML_LIBDIR) -o $@
 
+# Formal Stage-2 correctness workflow. Examples:
+#   make gate-g2a G2A_ARGS="--models q5"
+#   make gate-g2a G2A_ARGS="--models q4 q5 --prepare-oracles --hash-models"
+gate-g2a: $(NS) $(ORACLE_BINS)
+	python3 tools/gate_g2a.py $(G2A_ARGS)
+
 clean:
 	rm -rf build
 
@@ -136,6 +142,7 @@ help:
 	@echo "make bench      build bench/*.hip -> $(BUILDDIR)/"
 	@echo "make test       build+run tests/"
 	@echo "make tools      build tools/ (links llama.cpp ggml; oracle checks)"
+	@echo "make gate-g2a   run formal Stage-2 correctness workflow (G2A_ARGS=...)"
 	@echo "make clean"
 
 -include $(DEPS)

@@ -1110,6 +1110,20 @@ Gate G2 separates correctness from speed:
 - **G2b:** at least 33 tokens/s Q4 and 30 tokens/s Q5, with acceptable 32k-context
   degradation.
 
+The complete G2a check is executable as one workflow:
+
+```bash
+make gate-g2a G2A_ARGS="--models q4 q5 --prepare-oracles --hash-models"
+```
+
+It evaluates the four committed prompts (205 teacher-forced rows) and a 256-token
+p1 continuation for each blessed model. The pinned llama.cpp CPU stepwise and
+batched outputs are cached under `~/.cache/neutron-star`; missing references are
+created only when `--prepare-oracles` is present. Each run preserves a JSON
+manifest, exact commands, logs, and artifact hashes under
+`~/.cache/neutron-star/g2a-gate/runs/`, including RED runs. For a cheap inspection
+that changes nothing, add `--dry-run`.
+
 Arena/repack comes before GEMV because the weight layout and kernel access pattern
 must be designed together. GEMV comes before composite kernels because it streams
 most of the bytes and supplies their large projections.
