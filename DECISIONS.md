@@ -542,3 +542,30 @@ as already required by PLAN §4.4.
 This is not additional model state or weight transformation. It is the two-bank
 execution of the exact three-token history already budgeted by the plan, and it
 makes the ownership rule explicit for graph capture and MTP rollback.
+
+---
+
+## D11 — A2 keeps the exact short path and switches to tiled reduction by capacity
+
+**Date:** 2026-08-24 (Stage 2 task 7)
+**Implements:** PLAN §7.6's split-sequence attention design.
+
+An engine whose configured capacity is at most 1024 retains the accepted single-
+kernel attention path byte-for-byte. A larger-capacity engine allocates one reusable
+scratch set and launches prepare, sequence-tile, and finalize kernels for each of the
+16 full-attention layers. Capacity, rather than the current token index, selects the
+path so HIP graph topology is fixed across replay.
+
+The long tile is 512 tokens. One workgroup owns one `(tile, kv_head)` pair; its six
+active waves own the six GQA query heads. Eight waves copy eight K/V tokens with
+aligned 16-byte loads, then packed fp16-to-fp32 consumption computes a stable local
+softmax. The finalize kernel merges tile maxima/sums and performs the existing exact
+Q8_K handoff. Long-context scratch is shared across layers because execution is
+stream-ordered; it is not model state.
+
+The long path uses `__expf` inside the local softmax only. This does not affect G2a,
+which uses the unchanged short path, and is guarded by a literal CPU attention test:
+at three active tiles its maximum fp32 output error is **5.36e-7**, K-cache error is
+at most one fp16 rounding step, V-cache bits are exact, and the produced Q8_K blocks
+are byte-identical to quantizing the GPU fp32 output. This is an implementation of
+the PLAN tolerance, not a change to the model or KV format.

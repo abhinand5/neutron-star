@@ -88,6 +88,10 @@ struct RuntimeOffsets {
     size_t qg = 0;
     size_t key = 0;
     size_t value = 0;
+    size_t attention_query = 0;
+    size_t attention_tile_max = 0;
+    size_t attention_tile_sum = 0;
+    size_t attention_tile_output = 0;
     size_t ffn_gate = 0;
     size_t ffn_up = 0;
     size_t ffn_activated = 0;
@@ -117,6 +121,10 @@ struct DeviceBuffers {
     float* qg = nullptr;
     float* key = nullptr;
     float* value = nullptr;
+    float* attention_query = nullptr;
+    float* attention_tile_max = nullptr;
+    float* attention_tile_sum = nullptr;
+    float* attention_tile_output = nullptr;
     float* ffn_gate = nullptr;
     float* ffn_up = nullptr;
     float* ffn_activated = nullptr;
@@ -371,6 +379,30 @@ struct GpuEngine::Impl {
         offsets.qg = plan.take<float>(config.attn_q_dim());
         offsets.key = plan.take<float>(config.attn_kv_dim());
         offsets.value = plan.take<float>(config.attn_kv_dim());
+        const bool long_attention =
+            options.max_context > ATTENTION_LONG_CONTEXT_MIN_CAPACITY;
+        const size_t attention_tiles = long_attention
+            ? (size_t)attention_sequence_tiles(options.max_context) : 0;
+        size_t attention_tile_heads = 0;
+        if (!checked_multiply(attention_tiles,
+                              (size_t)ATTENTION_Q_HEADS,
+                              &attention_tile_heads)) {
+            if (error) *error = "attention scratch size overflow";
+            return false;
+        }
+        size_t attention_tile_values = 0;
+        if (!checked_multiply(attention_tile_heads,
+                              (size_t)ATTENTION_HEAD_DIM,
+                              &attention_tile_values)) {
+            if (error) *error = "attention tile output size overflow";
+            return false;
+        }
+        offsets.attention_query =
+            plan.take<float>(long_attention ? ATTENTION_OUTPUT_DIM : 0);
+        offsets.attention_tile_max = plan.take<float>(attention_tile_heads);
+        offsets.attention_tile_sum = plan.take<float>(attention_tile_heads);
+        offsets.attention_tile_output =
+            plan.take<float>(attention_tile_values);
         offsets.ffn_gate = plan.take<float>(config.n_ff);
         offsets.ffn_up = plan.take<float>(config.n_ff);
         offsets.ffn_activated = plan.take<float>(config.n_ff);
@@ -433,6 +465,14 @@ struct GpuEngine::Impl {
         buffers.qg = at<float>(offsets.qg);
         buffers.key = at<float>(offsets.key);
         buffers.value = at<float>(offsets.value);
+        buffers.attention_query = long_attention
+            ? at<float>(offsets.attention_query) : nullptr;
+        buffers.attention_tile_max = long_attention
+            ? at<float>(offsets.attention_tile_max) : nullptr;
+        buffers.attention_tile_sum = long_attention
+            ? at<float>(offsets.attention_tile_sum) : nullptr;
+        buffers.attention_tile_output = long_attention
+            ? at<float>(offsets.attention_tile_output) : nullptr;
         buffers.ffn_gate = at<float>(offsets.ffn_gate);
         buffers.ffn_up = at<float>(offsets.ffn_up);
         buffers.ffn_activated = at<float>(offsets.ffn_activated);
@@ -765,6 +805,10 @@ struct GpuEngine::Impl {
                 args.v_cache = buffers.v_cache + cache_offset;
                 args.gated_output = buffers.gated;
                 args.q8_output = options.integer_gemv ? buffers.q8 : nullptr;
+                args.query_scratch = buffers.attention_query;
+                args.tile_max = buffers.attention_tile_max;
+                args.tile_sum = buffers.attention_tile_sum;
+                args.tile_output = buffers.attention_tile_output;
                 args.step_control = device_control;
                 args.n_past = past_value;
                 args.capacity = options.max_context;

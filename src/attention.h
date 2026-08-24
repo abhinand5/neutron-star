@@ -21,6 +21,15 @@ static constexpr int ATTENTION_QG_DIM =
     2 * ATTENTION_Q_HEADS * ATTENTION_HEAD_DIM;
 static constexpr int ATTENTION_KV_DIM = ATTENTION_KV_HEADS * ATTENTION_HEAD_DIM;
 static constexpr int ATTENTION_OUTPUT_DIM = ATTENTION_Q_HEADS * ATTENTION_HEAD_DIM;
+static constexpr int ATTENTION_SEQUENCE_TILE = 512;
+// Small-capacity engines retain the single-workgroup-per-query-head kernel.
+// Larger engines use PLAN section 7.6's sequence-tiled two-pass path.
+static constexpr int ATTENTION_LONG_CONTEXT_MIN_CAPACITY = 1024;
+
+inline int attention_sequence_tiles(int capacity) {
+    return capacity > 0
+        ? (capacity + ATTENTION_SEQUENCE_TILE - 1) / ATTENTION_SEQUENCE_TILE : 0;
+}
 
 // All pointers are device pointers. The fp16 caches are token-major:
 // [capacity][4 kv heads][256 dimensions]. `n_past` is the append slot and the
@@ -36,6 +45,12 @@ struct AttentionStepArgs {
     uint16_t* v_cache = nullptr;     // fp16 [capacity][4][256]
     float* gated_output = nullptr;   // [24][256]
     block_q8_K* q8_output = nullptr; // optional [24], exact gated activation
+    // Reusable long-context scratch. Required only when capacity exceeds
+    // ATTENTION_LONG_CONTEXT_MIN_CAPACITY; one set is shared by all layers.
+    float* query_scratch = nullptr;  // [24][256]
+    float* tile_max = nullptr;       // [ceil(capacity/tile)][24]
+    float* tile_sum = nullptr;       // [ceil(capacity/tile)][24]
+    float* tile_output = nullptr;    // [ceil(capacity/tile)][24][256]
     const int32_t* step_control = nullptr; // optional [token, position, n_past]
     int n_past = 0;
     int capacity = 0;

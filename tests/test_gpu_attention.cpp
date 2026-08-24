@@ -128,8 +128,7 @@ static void cpu_attention_step(const HostAttentionArgs& args) {
         for (int dim = 0; dim < ATTENTION_HEAD_DIM; dim++) {
             const size_t index =
                 ((size_t)args.n_past * ATTENTION_KV_HEADS + head) *
-                    ATTENTION_HEAD_DIM +
-                dim;
+                    ATTENTION_HEAD_DIM + dim;
             args.k_cache[index] =
                 half_bits(key[head * ATTENTION_HEAD_DIM + dim]);
             args.v_cache[index] =
@@ -164,8 +163,7 @@ static void cpu_attention_step(const HostAttentionArgs& args) {
             for (int token = 0; token <= args.n_past; token++) {
                 const size_t index =
                     ((size_t)token * ATTENTION_KV_HEADS + kv_head) *
-                        ATTENTION_HEAD_DIM +
-                    dim;
+                        ATTENTION_HEAD_DIM + dim;
                 value += scores[token] / sum * half_float(args.v_cache[index]);
             }
             const float gate =
@@ -268,8 +266,7 @@ int main() {
             for (int dim = 0; dim < ATTENTION_HEAD_DIM; dim++) {
                 const size_t index =
                     ((size_t)token * ATTENTION_KV_HEADS + head) *
-                        ATTENTION_HEAD_DIM +
-                    dim;
+                        ATTENTION_HEAD_DIM + dim;
                 k_cache_cpu[index] =
                     half_bits(0.15f * random_signed(&random) + 0.07f * head);
                 v_cache_cpu[index] =
@@ -384,11 +381,121 @@ int main() {
         CHECK(v_cache_gpu == v_cache_cpu);
     }
 
+    // PLAN section 7.6: exercise the sequence-tiled path across multiple active
+    // tiles. It must retain the same fp16-cache contract and fp32 error bound.
+    constexpr int long_capacity = 1536;
+    constexpr int long_n_past = 1024;
+    const int long_tiles = attention_sequence_tiles(long_capacity);
+    const size_t long_cache_count =
+        (size_t)long_capacity * ATTENTION_KV_DIM;
+    const size_t long_tile_heads =
+        (size_t)long_tiles * ATTENTION_Q_HEADS;
+    std::vector<uint16_t> long_k_cpu(long_cache_count);
+    std::vector<uint16_t> long_v_cpu(long_cache_count);
+    std::vector<uint16_t> long_k_gpu(long_cache_count);
+    std::vector<uint16_t> long_v_gpu(long_cache_count);
+    std::vector<float> long_expected(ATTENTION_OUTPUT_DIM);
+    std::vector<float> long_actual(ATTENTION_OUTPUT_DIM);
+    for (int token = 0; token < long_n_past; token++) {
+        for (int head = 0; head < ATTENTION_KV_HEADS; head++) {
+            for (int dim = 0; dim < ATTENTION_HEAD_DIM; dim++) {
+                const size_t index =
+                    ((size_t)token * ATTENTION_KV_HEADS + head) *
+                        ATTENTION_HEAD_DIM + dim;
+                long_k_cpu[index] = half_bits(
+                    0.15f * random_signed(&random) + 0.07f * head);
+                long_v_cpu[index] = half_bits(
+                    0.30f * random_signed(&random) + 0.11f * head);
+            }
+        }
+    }
+    long_k_gpu = long_k_cpu;
+    long_v_gpu = long_v_cpu;
+    fill_random(&qg, &random, 0.7f);
+    fill_random(&k, &random, 0.7f);
+    fill_random(&v, &random, 0.7f);
+    cpu_attention_step({qg, k, v, q_norm, k_norm, long_k_cpu,
+                        long_v_cpu, long_expected, long_n_past, 4097});
+
+    uint16_t* d_long_k = device_allocate<uint16_t>(long_cache_count);
+    uint16_t* d_long_v = device_allocate<uint16_t>(long_cache_count);
+    float* d_long_query = device_allocate<float>(ATTENTION_OUTPUT_DIM);
+    float* d_long_max = device_allocate<float>(long_tile_heads);
+    float* d_long_sum = device_allocate<float>(long_tile_heads);
+    float* d_long_output = device_allocate<float>(
+        long_tile_heads * ATTENTION_HEAD_DIM);
+    HIP_CHECK(hipMemcpyAsync(d_qg, qg.data(), qg.size() * sizeof(float),
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(d_k, k.data(), k.size() * sizeof(float),
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(d_v, v.data(), v.size() * sizeof(float),
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(d_long_k, long_k_gpu.data(),
+                             long_cache_count * sizeof(uint16_t),
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(d_long_v, long_v_gpu.data(),
+                             long_cache_count * sizeof(uint16_t),
+                             hipMemcpyHostToDevice, stream));
+    AttentionStepArgs long_args = gpu_args;
+    long_args.k_cache = d_long_k;
+    long_args.v_cache = d_long_v;
+    long_args.query_scratch = d_long_query;
+    long_args.tile_max = d_long_max;
+    long_args.tile_sum = d_long_sum;
+    long_args.tile_output = d_long_output;
+    long_args.capacity = long_capacity;
+    long_args.n_past = long_n_past;
+    long_args.position = 4097;
+    AttentionStepArgs missing_scratch = long_args;
+    missing_scratch.query_scratch = nullptr;
+    CHECK(!gpu_attention_step(missing_scratch, stream, &error));
+    error.clear();
+    CHECK(gpu_attention_step(long_args, stream, &error));
+    CHECK(error.empty());
+    HIP_CHECK(hipMemcpyAsync(long_actual.data(), d_output,
+                             long_actual.size() * sizeof(float),
+                             hipMemcpyDeviceToHost, stream));
+    std::vector<block_q8_K> long_q8_gpu(ATTENTION_Q_HEADS);
+    HIP_CHECK(hipMemcpyAsync(long_q8_gpu.data(), d_q8,
+                             long_q8_gpu.size() * sizeof(block_q8_K),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(long_k_gpu.data(), d_long_k,
+                             long_cache_count * sizeof(uint16_t),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(long_v_gpu.data(), d_long_v,
+                             long_cache_count * sizeof(uint16_t),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    std::vector<block_q8_K> long_q8_cpu(ATTENTION_Q_HEADS);
+    quantize_row_q8_K(long_actual.data(), long_q8_cpu.data(),
+                      long_actual.size());
+    CHECK(memcmp(long_q8_gpu.data(), long_q8_cpu.data(),
+                 long_q8_cpu.size() * sizeof(block_q8_K)) == 0);
+    const double long_output_error =
+        compare_output(long_expected, long_actual);
+    worst_k_cache = std::max(
+        worst_k_cache,
+        compare_half_cache("long K cache", long_k_cpu, long_k_gpu,
+                           (size_t)(long_n_past + 1) * ATTENTION_KV_DIM));
+    CHECK(std::equal(
+        long_k_cpu.begin() + (long_n_past + 1) * ATTENTION_KV_DIM,
+        long_k_cpu.end(),
+        long_k_gpu.begin() + (long_n_past + 1) * ATTENTION_KV_DIM));
+    CHECK(long_v_gpu == long_v_cpu);
+
     printf("  GREEN — %d fp16-KV recurrent steps; output max %.3g; "
-           "K-cache max %.3g (<=1 fp16 step), V bits exact; %d checks\n",
-           steps, worst_output, worst_k_cache, g_checks);
+           "long(%d tiles) max %.3g; K-cache max %.3g (<=1 fp16 step), "
+           "V bits exact; %d checks\n",
+           steps, worst_output, long_tiles, long_output_error, worst_k_cache,
+           g_checks);
 
     hipError_t ignored = hipStreamDestroy(stream);
+    ignored = hipFree(d_long_output);
+    ignored = hipFree(d_long_sum);
+    ignored = hipFree(d_long_max);
+    ignored = hipFree(d_long_query);
+    ignored = hipFree(d_long_v);
+    ignored = hipFree(d_long_k);
     ignored = hipFree(d_v_cache);
     ignored = hipFree(d_k_cache);
     ignored = hipFree(d_output);

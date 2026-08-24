@@ -1809,3 +1809,139 @@ recovered cleanly. None remain in the tree.
 **NEXT:** Complete G2a: run the full Q5 oracle sweep and 256-token greedy checks
 for both blessed files. Then run formal depth-32768 G2b throughput measurements.
 Do not begin Stage 3 until all G2 acceptance conditions are green.
+
+---
+
+## 2026-08-24 — Session 16 (Stage 2 task 7: tiled 32K attention; G2 still red, GPT-5.6 Sol)
+
+**Task 7 and G2 remain open; Stage 3 is blocked.** The PLAN §7.6 long-context
+attention path improved Q5 depth-32768 decode from **2.379 ± 0.005** to
+**26.650 ± 0.004 t/s** (11.2x). Q5's 32K-retention sub-gate is green. Q4 reaches
+**30.101 ± 0.037 t/s**, but retains only 87.09% of the accepted Session-15
+depth-0 rate instead of 88%, so G2b is red. G2a also remains red on Q5.
+
+### 1. ESCALATE — Q5 exact-greedy contradiction (second stuck session)
+
+The full 205-row teacher-forced sweep and 256-token autoregressive continuation
+were rerun without changing D6/D8/D9 or weakening any threshold.
+
+| model/check | result | verdict |
+|---|---:|---|
+| Q4 teacher-forced | raw 204/205; triangulated 205/205; worst ns cosine 0.99599359 vs control floor 0.99598770 | GREEN |
+| Q5 teacher-forced | raw 204/205; triangulated 205/205; worst ns cosine **0.90784900** vs control floor **0.91065207** | **RED** |
+| Q5 p1 greedy 256 | first mismatch vs stepwise at 96; vs batched at 1; matches neither complete path | **RED** |
+
+Minimal preserved repro and evidence:
+
+```text
+~/.cache/neutron-star/g2a-q5-divergence/
+~/.cache/neutron-star/parity-205-q5/
+~/.cache/neutron-star/parity-205-q4-session15/
+~/.cache/neutron-star/greedy-256-q5/
+```
+
+```bash
+python3 tools/compare_tokens.py \
+  ~/.cache/neutron-star/greedy-256-q5/p1_ns_gpu.bin \
+  ~/.cache/neutron-star/greedy-256-q5/p1_ref_step.bin \
+  ~/.cache/neutron-star/greedy-256-q5/p1_ref_batch.bin \
+  --min-tokens 256 --label "G2a Q5 p1 greedy continuation"
+```
+
+At shared context position 12, layer localization is smooth rather than structural:
+CPU-reference vs llama-step cosine is 0.999992 at `l_out-0`, 0.999640 at
+`l_out-63`, and 0.99972997 at `final_output-1`. At the earliest greedy fork,
+GPU integer GEMV chooses token 579 over 11 by 0.06177 while GPU fp32 and cpu_ref
+choose 11 by 0.00304 and 0.00778. At shared position 96, GPU and llama-batch choose
+53218 while llama-step chooses 3349; all logits are near-ties and pairwise cosine is
+about 0.99977. This is an exact-argmax gate contradiction, not evidence supporting a
+new tolerance. Per PLAN §0, it is escalated and work moved to the independent G2b
+long-context task. Do not reinterpret the gate when returning to it.
+
+### 2. PLAN §7.6 long-context A2 implementation
+
+- Capacities `<= 1024` retain the accepted one-kernel short path. Larger engines
+  allocate one reusable scratch set and launch prepare, sequence-tile, and finalize
+  kernels; graph topology is fixed by capacity.
+- Each 512-token tile has four workgroups, one per KV head. Six waves compute its
+  GQA query heads. Eight waves stage eight tokens of K and V with aligned 16-byte
+  loads; packed half2 consumption and a stable chunk/tile softmax produce fp32
+  partials. Finalize merges the tile statistics, applies the sigmoid gate, and uses
+  the exact Q8_K handoff.
+- The winning kernel is **50 VGPR, 27 SGPR, 8192-byte LDS, no spills**, and uses
+  `--offload-arch=gfx1201` exactly.
+- The long literal CPU oracle covers capacity 1536 / `n_past=1024` across three
+  active tiles. Maximum output error is **5.36e-7**; K-cache error is <= one fp16
+  step, V-cache bits are exact, and Q8_K output is byte-identical.
+
+The original one-workgroup-per-query-head scan measured:
+
+```text
+2.386, 2.377, 2.373 t/s = 2.379 ± 0.005 t/s, 420.405 ms/token
+```
+
+The final long path's formal Q5 result is 11.2x faster.
+
+### 3. Formal G2b measurements
+
+Commands:
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 32768 \
+  --jsonl /tmp/ns-q5-session16-formal-depth32768.jsonl
+
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 32768 \
+  --jsonl /tmp/ns-q4-session16-formal-depth32768.jsonl
+```
+
+| model | run t/s | mean ± population SD | ms/token | vs Session-15 depth 0 | 32K sub-gate |
+|---|---|---:|---:|---:|---|
+| Q5_K_XL | 26.655, 26.651, 26.644 | **26.650 ± 0.004** | **37.523** | **88.82%** of 30.004 | **GREEN** (need 26.404) |
+| Q4_K_XL | 30.150, 30.092, 30.060 | **30.101 ± 0.037** | **33.222** | **87.09%** of 34.564 | **RED** (need 30.416) |
+
+Contemporaneous depth-0 retention commands used the same options with `--depth 0`:
+
+```text
+Q5: 29.999 ± 0.001 and repeat 29.998 ± 0.001 t/s, 33.335 ms/token
+Q4: 34.494 ± 0.016 t/s, 28.991 ms/token
+```
+
+Q4 remains red even against the contemporaneous result (87.26%, need 30.355 t/s).
+The Q5 reruns are 0.001–0.002 t/s below the literal 30 t/s absolute threshold, so
+they are recorded as marginally red; the preceding accepted Session-15 checkpoint
+was 30.004 ± 0.002. No gate is rounded upward.
+
+### 4. Correctness and regression verification
+
+```bash
+git diff --check
+make -j4 test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. The
+forward test remains a 346-node Q4 graph, reset replay is bit-exact, and graph ==
+eager. Every HIP compile line used `--offload-arch=gfx1201` exactly.
+
+### 5. Measured rejects (all rolled back)
+
+Rejected long-A2 variants included sequence tiles 128/256/384/640/1024; the
+barrier-per-token tile kernel; direct six-wave KV reads; scalar and half2 staging;
+chunk sizes 16/32; 192-thread six-wave launch; shared-V GQA accumulation;
+head-major KV layout; non-temporal loads; register prefetch; forced unrolling;
+wave-native OCKL reduction; and a short-path one-exp branch. Q5 probes ranged from
+17.608 to 26.594 t/s. The accepted aligned 16-byte stage was the material step
+(26.596 probe), and parallel weight evaluation retained **26.613** while reducing
+the long kernel from 57 to 50 VGPRs. None of the rejected forms remain.
+
+**NEXT:** Stay in Stage 2. First recover a robust literal >=30 t/s Q5 depth-0
+measurement/implementation, then isolate the remaining ~0.34 ms/token Q4 32K A2
+gap with kernel-level timing rather than more blind geometry sweeps. Re-run both
+formal G2b commands after any change. G2a's preserved minimal repro is escalated;
+return to it only with a new oracle/numerics hypothesis. Do not begin Stage 3 while
+either G2a or G2b is red.
