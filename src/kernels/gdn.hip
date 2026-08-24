@@ -14,6 +14,11 @@ __device__ float silu_f32(float value) {
     return value / (1.0f + expf(-value));
 }
 
+__device__ int nearest_integer(float value) {
+    value = __fadd_rn(value, 12582912.0f);
+    return (__float_as_int(value) & 0x007fffff) - 0x00400000;
+}
+
 __device__ float conv_silu(const GdnStepArgs& args, int channel) {
     float sum = 0.0f;
 #pragma unroll
@@ -42,6 +47,8 @@ void gdn_step_kernel(GdnStepArgs args) {
     __shared__ float inverse_q_norm;
     __shared__ float inverse_k_norm;
     __shared__ float inverse_rms;
+    __shared__ int winner_indices[16];
+    __shared__ int quant_owner;
 
     const int head = (int)blockIdx.x;
     const int thread = (int)threadIdx.x;
@@ -186,6 +193,96 @@ void gdn_step_kernel(GdnStepArgs args) {
             output_value * inverse_rms * args.ssm_norm[thread] *
             silu_f32(args.z[head * GDN_STATE_DIM + thread]);
     }
+
+    if (!args.q8_output) return;
+
+    // One Q8_K block spans two adjacent 128-wide heads. The last workgroup to
+    // publish its half owns quantization; threadfence + the atomic hand-off makes
+    // both halves visible without a grid-wide barrier. The owner resets the
+    // counter before this stream can launch the next layer/token invocation.
+    __syncthreads();
+    if (thread == 0) {
+        __threadfence();
+        const int old = atomicAdd(args.q8_ready + head / 2, 1);
+        quant_owner = old == 1;
+        if (quant_owner) __threadfence();
+    }
+    __syncthreads();
+    if (!quant_owner) return;
+
+    const int quant_block = head / 2;
+    const int quant_lane = thread;
+    const float quant_value = quant_lane < QK_K
+        ? args.gated_output[quant_block * QK_K + quant_lane] : 0.0f;
+    float maximum = quant_lane < QK_K ? fabsf(quant_value) : -1.0f;
+    int maximum_index = quant_lane;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_down(maximum, offset, 32);
+        const int other_index = __shfl_down(maximum_index, offset, 32);
+        if (lane < offset &&
+            (other > maximum ||
+             (other == maximum && other_index < maximum_index))) {
+            maximum = other;
+            maximum_index = other_index;
+        }
+    }
+    if (lane == 0 && wave < 8) {
+        wave_norm[wave] = maximum;
+        winner_indices[wave] = maximum_index;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        maximum = lane < 8 ? wave_norm[lane] : -1.0f;
+        maximum_index = lane < 8 ? winner_indices[lane] : QK_K;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down(maximum, offset, 32);
+            const int other_index = __shfl_down(maximum_index, offset, 32);
+            if (lane < offset &&
+                (other > maximum ||
+                 (other == maximum && other_index < maximum_index))) {
+                maximum = other;
+                maximum_index = other_index;
+            }
+        }
+        if (lane == 0) {
+            wave_norm[0] = maximum;
+            winner_indices[0] = maximum_index;
+        }
+    }
+    __syncthreads();
+
+    if (quant_lane < QK_K) {
+        block_q8_K& block = args.q8_output[quant_block];
+        if (wave_norm[0] == 0.0f) {
+            block.qs[quant_lane] = 0;
+            if (quant_lane < QK_K / 16) block.bsums[quant_lane] = 0;
+            if (quant_lane == 0) block.d = 0.0f;
+        } else {
+            const float selected = args.gated_output[
+                quant_block * QK_K + winner_indices[0]];
+            const float inverse_scale = __fdiv_rn(-127.0f, selected);
+            int quant = nearest_integer(__fmul_rn(inverse_scale, quant_value));
+            if (quant > 127) quant = 127;
+            block.qs[quant_lane] = (int8_t)quant;
+            int group_sum = quant;
+#pragma unroll
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                const int other = __shfl_down(group_sum, offset, 32);
+                if (lane % 16 < offset) group_sum += other;
+            }
+            if (lane == 0 || lane == 16)
+                block.bsums[quant_lane / 16] = (int16_t)group_sum;
+            if (quant_lane == 0)
+                block.d = __fdiv_rn(1.0f, inverse_scale);
+        }
+    }
+    __syncthreads();
+    if (thread == 0) {
+        __threadfence();
+        atomicExch(args.q8_ready + quant_block, 0);
+    }
 }
 
 bool hip_result(hipError_t result, const char* operation, std::string* error) {
@@ -202,7 +299,8 @@ bool gpu_gdn_step(const GdnStepArgs& args, hipStream_t stream, std::string* erro
     if (!stream || !args.mixed || !args.z || !args.beta_raw || !args.alpha_raw ||
         !args.ssm_a || !args.dt_bias || !args.conv_weight || !args.ssm_norm ||
         !args.conv_state_in || !args.conv_state_out || !args.ssm_state ||
-        !args.gated_output || args.conv_state_in == args.conv_state_out) {
+        !args.gated_output || args.conv_state_in == args.conv_state_out ||
+        ((args.q8_output == nullptr) != (args.q8_ready == nullptr))) {
         if (error) *error = "invalid GDN buffers or aliased convolution state";
         return false;
     }

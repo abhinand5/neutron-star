@@ -3,6 +3,8 @@
 // ============================================================================
 #pragma once
 
+#include "quants.h"
+
 #include <hip/hip_runtime_api.h>
 
 #include <string>
@@ -33,6 +35,8 @@ struct GdnStepArgs {
     float* conv_state_out = nullptr;       // [3][10240]
     float* ssm_state = nullptr;            // [48][128][128], [head][j][r]
     float* gated_output = nullptr;         // [48][128]
+    block_q8_K* q8_output = nullptr;       // optional [6144/256]
+    int32_t* q8_ready = nullptr;           // optional [6144/256], initially zero
 };
 
 bool gpu_gdn_step(const GdnStepArgs& args, hipStream_t stream,

@@ -79,6 +79,7 @@ struct RuntimeOffsets {
     size_t normalized = 0;
     size_t residual = 0;
     size_t q8 = 0;
+    size_t ffn_q8 = 0;
     size_t gdn_mixed = 0;
     size_t gdn_z = 0;
     size_t alpha = 0;
@@ -92,6 +93,9 @@ struct RuntimeOffsets {
     size_t ffn_activated = 0;
     size_t logits = 0;
     size_t step_control = 0;
+    size_t gdn_q8_ready = 0;
+    size_t ffn_q8_ready = 0;
+    size_t residual_norm_ready = 0;
     size_t conv_a = 0;
     size_t conv_b = 0;
     size_t ssm = 0;
@@ -104,6 +108,7 @@ struct DeviceBuffers {
     float* normalized = nullptr;
     float* residual = nullptr;
     block_q8_K* q8 = nullptr;
+    block_q8_K* ffn_q8 = nullptr;
     float* gdn_mixed = nullptr;
     float* gdn_z = nullptr;
     float* alpha = nullptr;
@@ -117,6 +122,9 @@ struct DeviceBuffers {
     float* ffn_activated = nullptr;
     float* logits = nullptr;
     int32_t* step_control = nullptr;
+    int32_t* gdn_q8_ready = nullptr;
+    int32_t* ffn_q8_ready = nullptr;
+    int32_t* residual_norm_ready = nullptr;
     float* conv_a = nullptr;
     float* conv_b = nullptr;
     float* ssm = nullptr;
@@ -157,6 +165,17 @@ struct PendingProfile {
 
 const float* f32_data(const GpuTensor* tensor) {
     return reinterpret_cast<const float*>(tensor->data);
+}
+
+const char* ffn_down_profile_name(bool attention, int32_t type) {
+    switch (type) {
+        case NS_Q4_K:   return attention ? "A5 FFN down Q4" : "K5 FFN down Q4";
+        case NS_Q5_K:   return attention ? "A5 FFN down Q5" : "K5 FFN down Q5";
+        case NS_Q6_K:   return attention ? "A5 FFN down Q6" : "K5 FFN down Q6";
+        case NS_IQ4_XS: return attention ? "A5 FFN down IQ4" : "K5 FFN down IQ4";
+        default:        return attention ? "A5 FFN down other"
+                                         : "K5 FFN down other";
+    }
 }
 
 }  // namespace
@@ -343,6 +362,7 @@ struct GpuEngine::Impl {
         offsets.normalized = plan.take<float>(config.n_embd);
         offsets.residual = plan.take<float>(config.n_embd);
         offsets.q8 = plan.take_bytes(gpu_q8_K_bytes(config.n_ff));
+        offsets.ffn_q8 = plan.take_bytes(gpu_q8_K_bytes(config.n_ff));
         offsets.gdn_mixed = plan.take<float>(config.gdn_qkv_dim());
         offsets.gdn_z = plan.take<float>(config.ssm_inner_size);
         offsets.alpha = plan.take<float>(config.ssm_time_step_rank);
@@ -356,6 +376,10 @@ struct GpuEngine::Impl {
         offsets.ffn_activated = plan.take<float>(config.n_ff);
         offsets.logits = plan.take<float>(config.n_vocab);
         offsets.step_control = plan.take<int32_t>(3);
+        offsets.gdn_q8_ready =
+            plan.take<int32_t>(config.ssm_inner_size / QK_K);
+        offsets.ffn_q8_ready = plan.take<int32_t>(config.n_ff / QK_K);
+        offsets.residual_norm_ready = plan.take<int32_t>(2);
 
         const size_t conv_per_layer =
             (size_t)(config.ssm_conv_kernel - 1) * config.gdn_qkv_dim();
@@ -401,6 +425,7 @@ struct GpuEngine::Impl {
         buffers.normalized = at<float>(offsets.normalized);
         buffers.residual = at<float>(offsets.residual);
         buffers.q8 = at<block_q8_K>(offsets.q8);
+        buffers.ffn_q8 = at<block_q8_K>(offsets.ffn_q8);
         buffers.gdn_mixed = at<float>(offsets.gdn_mixed);
         buffers.gdn_z = at<float>(offsets.gdn_z);
         buffers.alpha = at<float>(offsets.alpha);
@@ -414,6 +439,10 @@ struct GpuEngine::Impl {
         buffers.ffn_activated = at<float>(offsets.ffn_activated);
         buffers.logits = at<float>(offsets.logits);
         buffers.step_control = at<int32_t>(offsets.step_control);
+        buffers.gdn_q8_ready = at<int32_t>(offsets.gdn_q8_ready);
+        buffers.ffn_q8_ready = at<int32_t>(offsets.ffn_q8_ready);
+        buffers.residual_norm_ready =
+            at<int32_t>(offsets.residual_norm_ready);
         buffers.conv_a = at<float>(offsets.conv_a);
         buffers.conv_b = at<float>(offsets.conv_b);
         buffers.ssm = at<float>(offsets.ssm);
@@ -460,6 +489,18 @@ struct GpuEngine::Impl {
             !hip_result(hipMemsetAsync(buffers.ssm, 0,
                                        ssm_count * sizeof(float), stream),
                         "clear GDN state", error) ||
+            !hip_result(hipMemsetAsync(
+                            buffers.gdn_q8_ready, 0,
+                            (config.ssm_inner_size / QK_K) * sizeof(int32_t),
+                            stream),
+                        "clear GDN Q8 readiness", error) ||
+            !hip_result(hipMemsetAsync(
+                            buffers.ffn_q8_ready, 0,
+                            (config.n_ff / QK_K) * sizeof(int32_t), stream),
+                        "clear FFN Q8 readiness", error) ||
+            !hip_result(hipMemsetAsync(buffers.residual_norm_ready, 0,
+                                       2 * sizeof(int32_t), stream),
+                        "clear residual-norm readiness", error) ||
             !hip_result(hipStreamSynchronize(stream), "synchronize state reset",
                         error)) return false;
         past = 0;
@@ -627,17 +668,35 @@ struct GpuEngine::Impl {
         const size_t cache_per_layer =
             (size_t)options.max_context * ATTENTION_KV_DIM;
 
+        bool attention_norm_ready = false;
+        bool final_norm_ready = false;
         for (uint32_t layer = 0; layer < config.n_layer_main; layer++) {
             const GpuLayerWeights& item = layers[layer];
-            if (!profile_begin(item.is_attention ? "A1 norm+qkv" : "K1 norm+projections",
-                               &profile_record, error)) return false;
-            if (!normalize(buffers.hidden, f32_data(item.attn_norm),
-                           buffers.normalized, config.n_embd, error))
-                return set_layer_error(layer, "attention norm/quantize", error);
+            if (!attention_norm_ready) {
+                if (!profile_begin(item.is_attention ? "A1a norm+Q8"
+                                                     : "K1a norm+Q8",
+                                   &profile_record, error)) return false;
+                if (!normalize(buffers.hidden, f32_data(item.attn_norm),
+                               buffers.normalized, config.n_embd, error))
+                    return set_layer_error(layer, "attention norm/quantize", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "attention norm profile", error);
+            }
+            attention_norm_ready = false;
+            bool post_norm_ready = false;
 
             if (item.is_attention) {
+                if (!profile_begin("A1b qkv projections", &profile_record, error))
+                    return set_layer_error(layer, "A1b profile", error);
                 bool projected = false;
-                if (item.attn_q->type == item.attn_k->type)
+                if (options.integer_gemv &&
+                    gpu_gemv_q8_K_f32_pair_supported(
+                        *item.attn_q, *item.attn_k, *item.attn_v))
+                    projected = gpu_gemv_q8_K_f32_pair(
+                        *item.attn_q, buffers.q8, buffers.qg, *item.attn_k,
+                        *item.attn_v, buffers.normalized, buffers.key,
+                        buffers.value, stream, error);
+                else if (item.attn_q->type == item.attn_k->type)
                     projected = gemv_pair(item.attn_q, item.attn_k,
                                           buffers.normalized, buffers.qg,
                                           buffers.key, error) &&
@@ -665,7 +724,7 @@ struct GpuEngine::Impl {
                 if (!projected)
                     return set_layer_error(layer, "attention projections", error);
                 if (!profile_end(profile_record, error))
-                    return set_layer_error(layer, "A1 profile", error);
+                    return set_layer_error(layer, "A1b profile", error);
                 const size_t cache_offset =
                     (size_t)item.state_index * cache_per_layer;
                 AttentionStepArgs args;
@@ -688,22 +747,66 @@ struct GpuEngine::Impl {
                     return set_layer_error(layer, "A2", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "A2 profile", error);
-                if (!profile_begin("A3 output+residual", &profile_record, error))
+                const bool q8_post_norm = options.integer_gemv &&
+                    gpu_gemv_q8_K_add_norm_supported(*item.attn_out);
+                const bool f32_post_norm = options.integer_gemv &&
+                    gpu_gemv_f32_add_norm_supported(*item.attn_out);
+                post_norm_ready = q8_post_norm || f32_post_norm;
+                if (!profile_begin(post_norm_ready
+                                       ? "A3 output+residual+FFN norm+Q8"
+                                       : "A3 output+residual",
+                                   &profile_record, error))
                     return set_layer_error(layer, "A3 profile", error);
-                if (!gemv_add(item.attn_out, buffers.gated, buffers.hidden, error))
+                const bool output_ok = q8_post_norm
+                    ? gpu_gemv_q8_K_add_norm(
+                          *item.attn_out, buffers.q8, buffers.hidden,
+                          f32_data(item.post_attn_norm), buffers.normalized,
+                          buffers.q8, buffers.residual_norm_ready,
+                          config.rms_eps, stream, error)
+                    : f32_post_norm
+                        ? gpu_gemv_f32_add_norm(
+                              *item.attn_out, buffers.gated, buffers.hidden,
+                              f32_data(item.post_attn_norm), buffers.normalized,
+                              buffers.q8, buffers.residual_norm_ready,
+                              config.rms_eps, stream, error)
+                        : gemv_add(item.attn_out, buffers.gated,
+                                   buffers.hidden, error);
+                if (!output_ok)
                     return set_layer_error(layer, "attention output", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "A3 profile", error);
             } else {
-                if (!gemv_pair(item.attn_qkv, item.attn_gate,
-                               buffers.normalized, buffers.gdn_mixed,
-                               buffers.gdn_z, error) ||
-                    !gpu_gemv_f32_pair(*item.ssm_alpha, *item.ssm_beta,
-                                       buffers.normalized, buffers.alpha,
-                                       buffers.beta, stream, error))
-                    return set_layer_error(layer, "GDN projections", error);
+                const bool fused_projections = options.integer_gemv &&
+                    gpu_gemv_q8_K_pair_f32_pair_supported(
+                        *item.attn_qkv, *item.attn_gate, *item.ssm_alpha,
+                        *item.ssm_beta);
+                if (!profile_begin(fused_projections ? "K1b all projections"
+                                                     : "K1b qkv+gate",
+                                   &profile_record, error))
+                    return set_layer_error(layer, "K1b profile", error);
+                const bool projected = fused_projections
+                    ? gpu_gemv_q8_K_pair_f32_pair(
+                          *item.attn_qkv, *item.attn_gate, buffers.q8,
+                          buffers.gdn_mixed, buffers.gdn_z, *item.ssm_alpha,
+                          *item.ssm_beta, buffers.normalized, buffers.alpha,
+                          buffers.beta, stream, error)
+                    : gemv_pair(item.attn_qkv, item.attn_gate,
+                                buffers.normalized, buffers.gdn_mixed,
+                                buffers.gdn_z, error);
+                if (!projected)
+                    return set_layer_error(layer, "GDN qkv/gate", error);
                 if (!profile_end(profile_record, error))
-                    return set_layer_error(layer, "K1 profile", error);
+                    return set_layer_error(layer, "K1b profile", error);
+                if (!fused_projections) {
+                    if (!profile_begin("K1c alpha+beta", &profile_record, error))
+                        return set_layer_error(layer, "K1c profile", error);
+                    if (!gpu_gemv_f32_pair(*item.ssm_alpha, *item.ssm_beta,
+                                           buffers.normalized, buffers.alpha,
+                                           buffers.beta, stream, error))
+                        return set_layer_error(layer, "GDN alpha/beta", error);
+                    if (!profile_end(profile_record, error))
+                        return set_layer_error(layer, "K1c profile", error);
+                }
                 const size_t conv_offset =
                     (size_t)item.state_index * conv_per_layer;
                 const size_t ssm_offset =
@@ -721,50 +824,139 @@ struct GpuEngine::Impl {
                     conv_output_bank + conv_offset,
                     buffers.ssm + ssm_offset,
                     buffers.gated,
+                    options.integer_gemv ? buffers.q8 : nullptr,
+                    options.integer_gemv ? buffers.gdn_q8_ready : nullptr,
                 };
-                if (!profile_begin("K2 GDN", &profile_record, error))
+                if (!profile_begin(options.integer_gemv ? "K2 GDN+Q8" : "K2 GDN",
+                                   &profile_record, error))
                     return set_layer_error(layer, "K2 profile", error);
                 if (!gpu_gdn_step(args, stream, error))
                     return set_layer_error(layer, "K2", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "K2 profile", error);
-                if (!profile_begin("K3 output+residual", &profile_record, error))
-                    return set_layer_error(layer, "K3 profile", error);
-                if (!quantize(buffers.gated, config.ssm_inner_size, error) ||
-                    !gemv_add(item.ssm_out, buffers.gated, buffers.hidden, error))
+                if (!options.integer_gemv) {
+                    if (!profile_begin("K3a output Q8", &profile_record, error))
+                        return set_layer_error(layer, "K3a profile", error);
+                    if (!quantize(buffers.gated, config.ssm_inner_size, error))
+                        return set_layer_error(layer, "GDN output quantize", error);
+                    if (!profile_end(profile_record, error))
+                        return set_layer_error(layer, "K3a profile", error);
+                }
+                const bool q8_post_norm = options.integer_gemv &&
+                    gpu_gemv_q8_K_add_norm_supported(*item.ssm_out);
+                const bool f32_post_norm = options.integer_gemv &&
+                    gpu_gemv_f32_add_norm_supported(*item.ssm_out);
+                post_norm_ready = q8_post_norm || f32_post_norm;
+                if (!profile_begin(post_norm_ready
+                                       ? "K3b output+residual+FFN norm+Q8"
+                                       : "K3b output+residual",
+                                   &profile_record, error))
+                    return set_layer_error(layer, "K3b profile", error);
+                const bool output_ok = q8_post_norm
+                    ? gpu_gemv_q8_K_add_norm(
+                          *item.ssm_out, buffers.q8, buffers.hidden,
+                          f32_data(item.post_attn_norm), buffers.normalized,
+                          buffers.q8, buffers.residual_norm_ready,
+                          config.rms_eps, stream, error)
+                    : f32_post_norm
+                        ? gpu_gemv_f32_add_norm(
+                              *item.ssm_out, buffers.gated, buffers.hidden,
+                              f32_data(item.post_attn_norm), buffers.normalized,
+                              buffers.q8, buffers.residual_norm_ready,
+                              config.rms_eps, stream, error)
+                        : gemv_add(item.ssm_out, buffers.gated,
+                                   buffers.hidden, error);
+                if (!output_ok)
                     return set_layer_error(layer, "GDN output", error);
                 if (!profile_end(profile_record, error))
-                    return set_layer_error(layer, "K3 profile", error);
+                    return set_layer_error(layer, "K3b profile", error);
             }
 
-            if (!profile_begin(item.is_attention ? "A4 FFN up+gate" : "K4 FFN up+gate",
+            if (!post_norm_ready) {
+                if (!profile_begin(item.is_attention ? "A4a FFN norm+Q8"
+                                                     : "K4a FFN norm+Q8",
+                                   &profile_record, error))
+                    return set_layer_error(layer, "FFN norm profile", error);
+                if (!normalize(buffers.hidden, f32_data(item.post_attn_norm),
+                               buffers.normalized, config.n_embd, error))
+                    return set_layer_error(layer, "FFN norm/quantize", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "FFN norm profile", error);
+            }
+            const bool fused_ffn_activation = options.integer_gemv &&
+                gpu_gemv_q8_K_pair_activate_supported(*item.ffn_gate,
+                                                      *item.ffn_up);
+            if (!profile_begin(
+                    fused_ffn_activation
+                        ? (item.is_attention ? "A4b FFN up+gate+SiLU+Q8"
+                                             : "K4b FFN up+gate+SiLU+Q8")
+                        : (item.is_attention ? "A4b FFN up+gate"
+                                             : "K4b FFN up+gate"),
                                &profile_record, error))
-                return set_layer_error(layer, "FFN stage 4 profile", error);
-            if (!normalize(buffers.hidden, f32_data(item.post_attn_norm),
-                           buffers.normalized, config.n_embd, error))
-                return set_layer_error(layer, "FFN norm/quantize", error);
-            if (!gemv_pair(item.ffn_gate, item.ffn_up, buffers.normalized,
-                           buffers.ffn_gate, buffers.ffn_up, error) ||
-                !activate_ffn(error))
+                return set_layer_error(layer, "FFN projection profile", error);
+            const bool ffn_projected = fused_ffn_activation
+                ? gpu_gemv_q8_K_pair_activate(
+                      *item.ffn_gate, *item.ffn_up, buffers.q8,
+                      buffers.ffn_gate, buffers.ffn_up, buffers.ffn_activated,
+                      buffers.ffn_q8, buffers.ffn_q8_ready, stream, error)
+                : gemv_pair(item.ffn_gate, item.ffn_up, buffers.normalized,
+                            buffers.ffn_gate, buffers.ffn_up, error);
+            if (!ffn_projected)
                 return set_layer_error(layer, "FFN up/gate", error);
             if (!profile_end(profile_record, error))
-                return set_layer_error(layer, "FFN stage 4 profile", error);
-            if (!profile_begin(item.is_attention ? "A5 FFN down+residual"
-                                                 : "K5 FFN down+residual",
+                return set_layer_error(layer, "FFN projection profile", error);
+            if (!fused_ffn_activation) {
+                if (!profile_begin(item.is_attention ? "A4c SiLU+Q8"
+                                                     : "K4c SiLU+Q8",
+                                   &profile_record, error))
+                    return set_layer_error(layer, "FFN activation profile", error);
+                if (!activate_ffn(error))
+                    return set_layer_error(layer, "FFN activation", error);
+                if (!profile_end(profile_record, error))
+                    return set_layer_error(layer, "FFN activation profile", error);
+            }
+            if (!profile_begin(ffn_down_profile_name(item.is_attention,
+                                                     item.ffn_down->type),
                                &profile_record, error))
                 return set_layer_error(layer, "FFN stage 5 profile", error);
-            if (!gemv_add(item.ffn_down, buffers.ffn_activated, buffers.hidden,
-                          error))
+            const GpuTensor* following_norm =
+                layer + 1 < config.n_layer_main
+                    ? layers[layer + 1].attn_norm : output_norm;
+            const bool fuse_following_norm = options.integer_gemv &&
+                gpu_gemv_q8_K_add_norm_supported(*item.ffn_down);
+            const block_q8_K* down_input = fused_ffn_activation
+                ? buffers.ffn_q8 : buffers.q8;
+            const bool ffn_down_ok = fuse_following_norm
+                ? gpu_gemv_q8_K_add_norm(
+                      *item.ffn_down, down_input, buffers.hidden,
+                      f32_data(following_norm), buffers.normalized, buffers.q8,
+                      buffers.residual_norm_ready, config.rms_eps, stream, error)
+                : (fused_ffn_activation && has_vec_dot_q8_K(item.ffn_down->type)
+                       ? gpu_gemv_q8_K_add(*item.ffn_down, buffers.ffn_q8,
+                                           buffers.hidden, stream, error)
+                       : gemv_add(item.ffn_down, buffers.ffn_activated,
+                                  buffers.hidden, error));
+            if (!ffn_down_ok)
                 return set_layer_error(layer, "FFN", error);
+            if (fuse_following_norm) {
+                if (layer + 1 < config.n_layer_main) attention_norm_ready = true;
+                else final_norm_ready = true;
+            }
             if (!profile_end(profile_record, error))
                 return set_layer_error(layer, "FFN stage 5 profile", error);
         }
 
-        if (!profile_begin("H1 final norm", &profile_record, error)) return false;
-        if (!normalize(buffers.hidden, f32_data(output_norm), buffers.normalized,
-                       config.n_embd, error) ||
-            !profile_end(profile_record, error) ||
-            !profile_begin("H2 lm_head", &profile_record, error) ||
+        if (!final_norm_ready) {
+            if (!profile_begin("H1 final norm", &profile_record, error) ||
+                !normalize(buffers.hidden, f32_data(output_norm),
+                           buffers.normalized, config.n_embd, error) ||
+                !profile_end(profile_record, error)) {
+                poisoned = true;
+                if (error) *error = "output norm failed";
+                return false;
+            }
+        }
+        if (!profile_begin("H2 lm_head", &profile_record, error) ||
             !gemv(output, buffers.normalized, buffers.logits, error) ||
             !profile_end(profile_record, error)) {
             poisoned = true;

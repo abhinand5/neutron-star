@@ -181,11 +181,12 @@ bool repack_layout(int32_t type, RepackLayout* out, std::string* error) {
             out->planes[2] = field<block_q4_K>(offsetof(block_q4_K, d), 2 * sizeof(ns_half));
             break;
         case NS_Q5_K:
-            out->plane_count = 4;
+            out->plane_count = 3;
             out->planes[0] = field<block_q5_K>(offsetof(block_q5_K, qs), sizeof(block_q5_K::qs));
             out->planes[1] = field<block_q5_K>(offsetof(block_q5_K, qh), sizeof(block_q5_K::qh));
-            out->planes[2] = field<block_q5_K>(offsetof(block_q5_K, scales), sizeof(block_q5_K::scales));
-            out->planes[3] = field<block_q5_K>(offsetof(block_q5_K, d), 2 * sizeof(ns_half));
+            out->planes[2] = field<block_q5_K>(
+                offsetof(block_q5_K, d), 2 * sizeof(ns_half) +
+                                             sizeof(block_q5_K::scales));
             break;
         case NS_Q6_K:
             out->plane_count = 4;

@@ -1582,3 +1582,134 @@ HIP compile line used `--offload-arch=gfx1201` exactly.
 profiling and weight-kernel improvements; do not regress Q4's narrow green margin.
 Then complete the full Q5 oracle sweep, 256-token greedy G2a runs on both files,
 and formal depth-32768 G2b measurements before entering Stage 3.
+
+---
+
+## 2026-08-24 — Session 14 (Stage 2 task 7 checkpoint: deep decode fusion, Q5 29.851 t/s, GPT-5.6 Sol)
+
+**Task 7 and G2b remain open.** Q4's depth-0 half was already green; Q5 improved
+from 28.695 to **29.851 ± 0.002 t/s**, leaving 0.149 t/s / 0.167 ms per token to
+the 30 t/s gate. No Stage 3 work has started.
+
+### 1. Exact fusion depth and dispatch reduction
+
+The integer decode path now carries exact Q8_K activations through the whole layer:
+
+- GDN's qkv/gate integer projections and Q8_0 alpha/beta projections share one
+  dispatch when their types are compatible. Attention's common integer-Q plus
+  Q8_0 K/V pattern likewise shares one dispatch.
+- K2 writes its exact Q8_K output in-kernel. Adjacent 128-wide head groups use
+  completion counters so each 256-element Q8 block has one deterministic owner.
+- FFN gate/up projection completion triggers the exact SiLU×up and Q8_K
+  quantization in the projection kernel. A distinct `ffn_q8` buffer prevents the
+  output from overwriting Q8 input that another workgroup can still consume.
+- Integer residual GEMVs fuse the following RMSNorm and Q8_K quantization. Split-4
+  kernels pack two 32-row output tiles in one 256-thread workgroup; the last 20
+  workgroups perform the same fixed-order norm reduction as the standalone kernel.
+- The five Q8_0 output projections now use the equivalent fp32-dequant residual /
+  RMSNorm / Q8_K fusion. This removed another five Q5 graph nodes.
+
+The Q5 graph is now **341 nodes per parity** (677 at the previous checkpoint; 1,141
+before task 7). Q4 is **364** (657 previously). All fusions preserve each matrix's
+standalone K-split reduction order.
+
+### 2. Q5/Q6 weight-path tuning
+
+Q5_K's unchanged GGUF fields `{d,dmin,scales[12]}` are stored as one 16-byte
+auxiliary repack plane. The repack remains an exact invertible permutation, but the
+kernel now fetches the three scale words and both deltas with one vector load.
+The primary and high-bit planes use temporal loads; only the large Q5 auxiliary
+path uses the measured non-temporal variant.
+
+Two compiler-scheduling changes were repeatable full-model wins without changing
+arithmetic:
+
+- serializing Q6_K's two decode halves reduced split-4 VGPR use from 130 to 79;
+- serializing Q5_K's two 16-byte chunks reduced the large kernel from 178 to 138
+  VGPRs and raised six consecutive tg64 samples to 29.828, 29.861, 29.858,
+  29.859, 29.858, and 29.856 t/s.
+
+The warmed eager localization profile after these changes was:
+
+```text
+PROFILED KERNEL TOTAL       34662.92 us
+K1 projections              5266.05 us (46 fused + 2 fallback layers)
+K2 GDN+Q8                     954.57 us
+K3/A3 output+norm+Q8         3321.44 us
+K4/A4 FFN up+gate           13695.57 us
+K5/A5 FFN down               7404.84 us
+A1 projections               1571.90 us
+A2 attention                  173.28 us
+H2 head                      2130.30 us
+```
+
+Command:
+
+```bash
+./build/release/ns gpu-eval \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 760,3712 --ctx 2 --topk 1 --no-graph --profile
+```
+
+### 3. Formal depth-0 Q5 checkpoint
+
+Command (the step streams 19.47 GB, so the working set is honest):
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl /tmp/ns-q5-current-formal.jsonl
+```
+
+```text
+run 1: 17.150902 s, 29.853 t/s
+run 2: 17.151610 s, 29.851 t/s
+run 3: 17.153861 s, 29.848 t/s
+RESULT: 29.851 ± 0.002 t/s, 33.500 ms/token — RED by 0.167 ms/token
+```
+
+The pre-auxiliary-layout formal Q4 result on the same fused execution path was
+**34.080 ± 0.010 t/s** (34.079, 34.093, 34.069), comfortably above its 33 target.
+The current layout was rechecked by full recurrent logits below, but its formal
+512-token number should be rerun when Q5 crosses the gate.
+
+### 4. Correctness and regression verification
+
+Commands:
+
+```bash
+git diff --check
+make -j4 test
+ns_p1_tokens=$(<tests/prompts/p1.tokens)
+./build/release/ns gpu-eval \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens "$ns_p1_tokens" --ctx 64 --topk 1 \
+  --dump-logits /tmp/ns-q4-p1-current.bin
+sha256sum /tmp/ns-q4-p1-current.bin
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. Every
+HIP compile line used `--offload-arch=gfx1201` exactly. The 31-position Q4 recurrent
+fp32-logit hash remains byte-identical to task 6/13:
+
+```text
+0b9507a344459877cf89f2be367bc0976359c0092bf80eeb2819f665fe4776e9
+```
+
+### 5. Measured rejects (all rolled back)
+
+Rejected variants included: mixed attention pairing; graph queues of 32/unbounded;
+GDN state rereads; Q5 LDS staging, lane-0 broadcasts, alternative unrolls and
+fixed-tile address specializations; Q5/Q6 down split changes; standalone RMSNorm
+barriers/single-workgroup forms; `__restrict__`; vectorized Q8_0 indexed loops; a
+four-wave GDN specialization; and a split Q6 scale-plane layout. The latter was
+bit-exact and cut split-4 from 130 to 90 VGPRs, but measured 29.699 vs 29.709 t/s.
+None remain in the tree.
+
+**NEXT:** Recover the final 0.167 ms/token on Q5, with Q5's 138-VGPR large kernel
+and the two Q8_0-gate GDN projection fallbacks as the best remaining evidence-led
+targets. Then rerun formal Q4/Q5 depth 0, complete G2a's Q5 oracle/256-token greedy
+sweeps, and run depth 32768 before entering Stage 3.

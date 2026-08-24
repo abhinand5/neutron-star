@@ -21,6 +21,12 @@ bool gpu_gemv_f32(const GpuTensor& tensor, const float* input, float* output,
 bool gpu_gemv_f32_add(const GpuTensor& tensor, const float* input,
                       float* destination, hipStream_t stream,
                       std::string* error = nullptr);
+bool gpu_gemv_f32_add_norm_supported(const GpuTensor& tensor);
+bool gpu_gemv_f32_add_norm(
+    const GpuTensor& tensor, const float* input, float* destination,
+    const float* norm_weight, float* normalized, block_q8_K* normalized_q8,
+    int32_t* ready, float epsilon, hipStream_t stream,
+    std::string* error = nullptr);
 bool gpu_gemv_f32_pair(const GpuTensor& first, const GpuTensor& second,
                        const float* input, float* first_output,
                        float* second_output, hipStream_t stream,
@@ -49,11 +55,41 @@ bool gpu_gemv_q8_K_pair(const GpuTensor& first, const GpuTensor& second,
                         const block_q8_K* input, float* first_output,
                         float* second_output, hipStream_t stream,
                         std::string* error = nullptr);
+bool gpu_gemv_q8_K_pair_activate_supported(const GpuTensor& first,
+                                           const GpuTensor& second);
+bool gpu_gemv_q8_K_pair_activate(
+    const GpuTensor& first, const GpuTensor& second, const block_q8_K* input,
+    float* gate_output, float* up_output, float* activated,
+    block_q8_K* activated_q8, int32_t* ready, hipStream_t stream,
+    std::string* error = nullptr);
+bool gpu_gemv_q8_K_pair_f32_pair_supported(const GpuTensor& first,
+                                           const GpuTensor& second,
+                                           const GpuTensor& third,
+                                           const GpuTensor& fourth);
+bool gpu_gemv_q8_K_pair_f32_pair(
+    const GpuTensor& first, const GpuTensor& second, const block_q8_K* q8_input,
+    float* first_output, float* second_output, const GpuTensor& third,
+    const GpuTensor& fourth, const float* f32_input, float* third_output,
+    float* fourth_output, hipStream_t stream, std::string* error = nullptr);
+bool gpu_gemv_q8_K_f32_pair_supported(const GpuTensor& first,
+                                      const GpuTensor& second,
+                                      const GpuTensor& third);
+bool gpu_gemv_q8_K_f32_pair(
+    const GpuTensor& first, const block_q8_K* q8_input, float* first_output,
+    const GpuTensor& second, const GpuTensor& third, const float* f32_input,
+    float* second_output, float* third_output, hipStream_t stream,
+    std::string* error = nullptr);
 bool gpu_gemv_q8_K_pair_supported(const GpuTensor& first,
                                   const GpuTensor& second);
 bool gpu_gemv_q8_K_add(const GpuTensor& tensor, const block_q8_K* input,
                        float* destination, hipStream_t stream,
                        std::string* error = nullptr);
+bool gpu_gemv_q8_K_add_norm_supported(const GpuTensor& tensor);
+bool gpu_gemv_q8_K_add_norm(
+    const GpuTensor& tensor, const block_q8_K* input, float* destination,
+    const float* norm_weight, float* normalized, block_q8_K* normalized_q8,
+    int32_t* ready, float epsilon, hipStream_t stream,
+    std::string* error = nullptr);
 
 // Dequantizes one output row of a repacked matrix. This is the token-embedding
 // gather path; unlike GEMV it touches only the selected row's exact GGUF bits.

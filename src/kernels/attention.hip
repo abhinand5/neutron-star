@@ -205,14 +205,14 @@ void attention_step_kernel(AttentionStepArgs args) {
         int quant = nearest_integer(__fmul_rn(inverse_scale, gated));
         if (quant > 127) quant = 127;
         block.qs[dim] = (int8_t)quant;
-        __syncthreads();
-        if (dim < QK_K / 16) {
-            int sum = 0;
+        int group_sum = quant;
 #pragma unroll
-            for (int index = 0; index < 16; index++)
-                sum += block.qs[dim * 16 + index];
-            block.bsums[dim] = (int16_t)sum;
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            const int other = __shfl_down(group_sum, offset, 32);
+            if (lane % 16 < offset) group_sum += other;
         }
+        if (lane == 0 || lane == 16)
+            block.bsums[dim / 16] = (int16_t)group_sum;
         if (dim == 0) block.d = __fdiv_rn(1.0f, inverse_scale);
     }
 }
