@@ -107,6 +107,7 @@ struct DeviceBuffers {
     float* input = nullptr;
     float* output = nullptr;
     float* second_output = nullptr;
+    float* third_output = nullptr;
     block_q8_K* q8 = nullptr;
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
@@ -116,6 +117,8 @@ struct DeviceBuffers {
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&output), output_count * sizeof(float)));
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&second_output),
                             output_count * sizeof(float)));
+        HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&third_output),
+                            output_count * sizeof(float)));
         HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&q8), gpu_q8_K_bytes((int64_t)input_count)));
         HIP_CHECK(hipEventCreate(&start));
         HIP_CHECK(hipEventCreate(&stop));
@@ -124,6 +127,7 @@ struct DeviceBuffers {
         hipError_t ignored = hipEventDestroy(start);
         ignored = hipEventDestroy(stop);
         ignored = hipFree(q8);
+        ignored = hipFree(third_output);
         ignored = hipFree(second_output);
         ignored = hipFree(output);
         ignored = hipFree(input);
@@ -344,6 +348,70 @@ static size_t test_model(const std::string& path, std::set<Shape>* covered,
         output_shapes->insert(source.ne[1]);
         input_shapes->insert(source.ne[0]);
         tested_bytes += source.nbytes;
+    }
+
+    // Every fused attention triple must reproduce its three standalone GPU
+    // projections bit-for-bit. This covers all-integer Q5/Q6 and the mixed
+    // Q4/Q5 + Q6 + fp32-Q8_0 patterns used by the blessed files.
+    activation.resize(5120);
+    make_activation(&activation, 0x7f4a7c15u);
+    HIP_CHECK(hipMemcpyAsync(device.input, activation.data(),
+                             activation.size() * sizeof(float),
+                             hipMemcpyHostToDevice, weights.stream()));
+    CHECK(gpu_quantize_q8_K(device.input, device.q8, 5120,
+                            weights.stream(), &error));
+    for (uint32_t layer = 0; layer < config.n_layer_main; layer++) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".attn_";
+        const GpuTensor* q = weights.tensor(prefix + "q.weight");
+        const GpuTensor* k = weights.tensor(prefix + "k.weight");
+        const GpuTensor* v = weights.tensor(prefix + "v.weight");
+        if (!q || !k || !v || !gpu_gemv_q8_K_triple_supported(*q, *k, *v))
+            continue;
+        std::vector<float> q_baseline((size_t)q->ne[1]);
+        std::vector<float> k_baseline((size_t)k->ne[1]);
+        std::vector<float> v_baseline((size_t)v->ne[1]);
+        std::vector<float> q_fused(q_baseline.size());
+        std::vector<float> k_fused(k_baseline.size());
+        std::vector<float> v_fused(v_baseline.size());
+        CHECK(gpu_gemv_q8_K(*q, device.q8, device.output,
+                            weights.stream(), &error));
+        CHECK(gpu_gemv_q8_K(*k, device.q8, device.second_output,
+                            weights.stream(), &error));
+        const bool v_ok = has_vec_dot_q8_K(v->type)
+            ? gpu_gemv_q8_K(*v, device.q8, device.third_output,
+                            weights.stream(), &error)
+            : gpu_gemv_f32(*v, device.input, device.third_output,
+                           weights.stream(), &error);
+        CHECK(v_ok);
+        HIP_CHECK(hipMemcpyAsync(q_baseline.data(), device.output,
+                                 q_baseline.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipMemcpyAsync(k_baseline.data(), device.second_output,
+                                 k_baseline.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipMemcpyAsync(v_baseline.data(), device.third_output,
+                                 v_baseline.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        CHECK(gpu_gemv_q8_K_triple(
+            *q, *k, *v, device.q8, device.input, device.output,
+            device.second_output, device.third_output, weights.stream(),
+            &error));
+        HIP_CHECK(hipMemcpyAsync(q_fused.data(), device.output,
+                                 q_fused.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipMemcpyAsync(k_fused.data(), device.second_output,
+                                 k_fused.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipMemcpyAsync(v_fused.data(), device.third_output,
+                                 v_fused.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, weights.stream()));
+        HIP_CHECK(hipStreamSynchronize(weights.stream()));
+        CHECK(memcmp(q_baseline.data(), q_fused.data(),
+                     q_fused.size() * sizeof(float)) == 0);
+        CHECK(memcmp(k_baseline.data(), k_fused.data(),
+                     k_fused.size() * sizeof(float)) == 0);
+        CHECK(memcmp(v_baseline.data(), v_fused.data(),
+                     v_fused.size() * sizeof(float)) == 0);
     }
     return tested_bytes;
 }

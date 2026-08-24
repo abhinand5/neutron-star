@@ -17,6 +17,9 @@ static constexpr int GDN_V_HEADS = 48;
 static constexpr int GDN_CONV_WIDTH = 4;
 static constexpr int GDN_QKV_DIM = 10240;
 static constexpr int GDN_INNER_DIM = 6144;
+static constexpr int GDN_Q8_BLOCKS = GDN_INNER_DIM / QK_K;
+static constexpr int GDN_Q8_READY_INTS =
+    GDN_Q8_BLOCKS + 2 * GDN_V_HEADS;
 
 // All pointers are device pointers. `conv_state_in` and `conv_state_out` are
 // distinct 3x10240 buffers: ping-pong avoids a cross-workgroup race because each
@@ -36,7 +39,9 @@ struct GdnStepArgs {
     float* ssm_state = nullptr;            // [48][128][128], [head][j][r]
     float* gated_output = nullptr;         // [48][128]
     block_q8_K* q8_output = nullptr;       // optional [6144/256]
-    int32_t* q8_ready = nullptr;           // optional [6144/256], initially zero
+    // Optional scratch: block counters followed by per-head max bits/indices.
+    // Counters are initially zero; summaries are overwritten on every launch.
+    int32_t* q8_ready = nullptr;           // [GDN_Q8_READY_INTS]
 };
 
 bool gpu_gdn_step(const GdnStepArgs& args, hipStream_t stream,

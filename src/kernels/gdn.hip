@@ -188,34 +188,21 @@ void gdn_step_kernel(GdnStepArgs args) {
         inverse_rms = rsqrtf(square_sum / GDN_STATE_DIM + 1.0e-6f);
     }
     __syncthreads();
+    float gated_value = 0.0f;
     if (thread < GDN_STATE_DIM) {
-        args.gated_output[head * GDN_STATE_DIM + thread] =
-            output_value * inverse_rms * args.ssm_norm[thread] *
-            silu_f32(args.z[head * GDN_STATE_DIM + thread]);
+        gated_value = output_value * inverse_rms * args.ssm_norm[thread] *
+                      silu_f32(args.z[head * GDN_STATE_DIM + thread]);
+        args.gated_output[head * GDN_STATE_DIM + thread] = gated_value;
     }
 
     if (!args.q8_output) return;
 
     // One Q8_K block spans two adjacent 128-wide heads. The last workgroup to
-    // publish its half owns quantization; threadfence + the atomic hand-off makes
-    // both halves visible without a grid-wide barrier. The owner resets the
-    // counter before this stream can launch the next layer/token invocation.
-    __syncthreads();
-    if (thread == 0) {
-        __threadfence();
-        const int old = atomicAdd(args.q8_ready + head / 2, 1);
-        quant_owner = old == 1;
-        if (quant_owner) __threadfence();
-    }
-    __syncthreads();
-    if (!quant_owner) return;
-
-    const int quant_block = head / 2;
-    const int quant_lane = thread;
-    const float quant_value = quant_lane < QK_K
-        ? args.gated_output[quant_block * QK_K + quant_lane] : 0.0f;
-    float maximum = quant_lane < QK_K ? fabsf(quant_value) : -1.0f;
-    int maximum_index = quant_lane;
+    // publish its half owns quantization. Each head reduces its local maximum
+    // before the hand-off, so the owner combines two summaries instead of
+    // reducing all 256 values behind two additional workgroup barriers.
+    float maximum = thread < GDN_STATE_DIM ? fabsf(gated_value) : -1.0f;
+    int maximum_index = thread;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         const float other = __shfl_down(maximum, offset, 32);
@@ -227,31 +214,57 @@ void gdn_step_kernel(GdnStepArgs args) {
             maximum_index = other_index;
         }
     }
-    if (lane == 0 && wave < 8) {
+    if (lane == 0 && wave < 4) {
         wave_norm[wave] = maximum;
         winner_indices[wave] = maximum_index;
     }
     __syncthreads();
-    if (wave == 0) {
-        maximum = lane < 8 ? wave_norm[lane] : -1.0f;
-        maximum_index = lane < 8 ? winner_indices[lane] : QK_K;
+    if (thread == 0) {
+        maximum = wave_norm[0];
+        maximum_index = winner_indices[0];
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other = __shfl_down(maximum, offset, 32);
-            const int other_index = __shfl_down(maximum_index, offset, 32);
-            if (lane < offset &&
-                (other > maximum ||
-                 (other == maximum && other_index < maximum_index))) {
+        for (int item = 1; item < 4; item++) {
+            const float other = wave_norm[item];
+            const int other_index = winner_indices[item];
+            if (other > maximum ||
+                (other == maximum && other_index < maximum_index)) {
                 maximum = other;
                 maximum_index = other_index;
             }
         }
-        if (lane == 0) {
-            wave_norm[0] = maximum;
-            winner_indices[0] = maximum_index;
+        args.q8_ready[GDN_Q8_BLOCKS + head] = __float_as_int(maximum);
+        args.q8_ready[GDN_Q8_BLOCKS + GDN_V_HEADS + head] = maximum_index;
+        __threadfence();
+        const int old = atomicAdd(args.q8_ready + head / 2, 1);
+        quant_owner = old == 1;
+        if (quant_owner) {
+            __threadfence();
+            const int first_head = 2 * (head / 2);
+            const float first_max = __int_as_float(
+                args.q8_ready[GDN_Q8_BLOCKS + first_head]);
+            const float second_max = __int_as_float(
+                args.q8_ready[GDN_Q8_BLOCKS + first_head + 1]);
+            const int first_index = args.q8_ready[
+                GDN_Q8_BLOCKS + GDN_V_HEADS + first_head];
+            const int second_index = GDN_STATE_DIM + args.q8_ready[
+                GDN_Q8_BLOCKS + GDN_V_HEADS + first_head + 1];
+            if (second_max > first_max ||
+                (second_max == first_max && second_index < first_index)) {
+                wave_norm[0] = second_max;
+                winner_indices[0] = second_index;
+            } else {
+                wave_norm[0] = first_max;
+                winner_indices[0] = first_index;
+            }
         }
     }
     __syncthreads();
+    if (!quant_owner) return;
+
+    const int quant_block = head / 2;
+    const int quant_lane = thread;
+    const float quant_value = quant_lane < QK_K
+        ? args.gated_output[quant_block * QK_K + quant_lane] : 0.0f;
 
     if (quant_lane < QK_K) {
         block_q8_K& block = args.q8_output[quant_block];
@@ -278,11 +291,10 @@ void gdn_step_kernel(GdnStepArgs args) {
                 block.d = __fdiv_rn(1.0f, inverse_scale);
         }
     }
-    __syncthreads();
-    if (thread == 0) {
-        __threadfence();
-        atomicExch(args.q8_ready + quant_block, 0);
-    }
+    // Both heads have already incremented this counter before an owner exists.
+    // A later GDN launch is stream-ordered after this whole kernel, so resetting
+    // scratch does not require a 512-thread barrier, fence, or atomic exchange.
+    if (thread == 0) args.q8_ready[quant_block] = 0;
 }
 
 bool hip_result(hipError_t result, const char* operation, std::string* error) {

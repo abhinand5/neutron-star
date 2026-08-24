@@ -24,6 +24,7 @@ __device__ __constant__ int8_t device_kvalues_iq4nl[16];
 __device__ __constant__ uint32_t device_iq3s_grid[512];
 
 using PackedWords4 = uint32_t __attribute__((ext_vector_type(4)));
+constexpr int Q8_K_REDUCTION_WAVES = QK_K / 32;
 
 struct PackedBlockView {
     const uint8_t* block;
@@ -482,7 +483,6 @@ void gemv_f32_kernel(const uint8_t* weights, RepackLayout layout, const float* i
 }
 
 __device__ void quantize_q8_K_shared(float value, float* values,
-                                     float* magnitudes, int* indices,
                                      block_q8_K& block);
 
 // K-split variant: every wave retains the repack contract (lane == output row)
@@ -498,9 +498,7 @@ void gemv_f32_split_kernel(const uint8_t* weights, RepackLayout layout,
                            int32_t* norm_ready, float norm_epsilon) {
     static_assert(KSplit >= 2 && KSplit <= 8, "supported K split");
     __shared__ float partial[KSplit * REPACK_ROW_TILE];
-    __shared__ float norm_values[FuseNorm ? QK_K : 1];
-    __shared__ float norm_magnitudes[FuseNorm ? QK_K : 1];
-    __shared__ int norm_indices[FuseNorm ? QK_K : 1];
+    __shared__ float norm_values[FuseNorm ? Q8_K_REDUCTION_WAVES : 1];
     __shared__ float norm_wave_sums[FuseNorm ? 8 : 1];
     __shared__ float norm_inverse_rms;
     const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
@@ -540,7 +538,6 @@ void gemv_f32_split_kernel(const uint8_t* weights, RepackLayout layout,
             __threadfence();
             atomicAdd(norm_ready, 1);
         }
-        __syncthreads();
         if ((int)blockIdx.x < (int)gridDim.x - norm_blocks) return;
         if (threadIdx.x == 0) {
             while (atomicAdd(norm_ready, 0) < (int)gridDim.x) {}
@@ -574,16 +571,13 @@ void gemv_f32_split_kernel(const uint8_t* weights, RepackLayout layout,
         const int index = norm_block * QK_K + thread;
         const float value =
             output[index] * norm_inverse_rms * norm_weight[index];
-        normalized[index] = value;
-        quantize_q8_K_shared(value, norm_values, norm_magnitudes, norm_indices,
-                             normalized_q8[norm_block]);
-        __syncthreads();
+        if (normalized) normalized[index] = value;
+        quantize_q8_K_shared(value, norm_values, normalized_q8[norm_block]);
         if (thread == 0) {
             const int old = atomicAdd(norm_ready + 1, 1);
             if (old == norm_blocks - 1) {
-                atomicExch(norm_ready, 0);
-                __threadfence();
-                atomicExch(norm_ready + 1, 0);
+                norm_ready[0] = 0;
+                norm_ready[1] = 0;
             }
         }
     }
@@ -640,14 +634,13 @@ __device__ int nearest_integer(float value) {
 }
 
 __device__ void quantize_q8_K_shared(float value, float* values,
-                                     float* magnitudes, int* indices,
                                      block_q8_K& block) {
     const int lane = (int)threadIdx.x;
     const int wave_lane = lane & 31;
     const int wave = lane >> 5;
-    values[lane] = value;
     float maximum = fabsf(value);
-    int maximum_index = lane;
+    int maximum_index = wave_lane;
+    float selected_value = value;
     // Selection is order-independent because magnitudes are not accumulated:
     // the exact rule is max(abs(value)), then lowest element index on ties.
     // Reduce inside each hardware wave, then reduce the eight wave winners.
@@ -656,45 +649,48 @@ __device__ void quantize_q8_K_shared(float value, float* values,
     for (int offset = 16; offset > 0; offset >>= 1) {
         const float other = __shfl_down(maximum, offset, 32);
         const int other_index = __shfl_down(maximum_index, offset, 32);
+        const float other_value = __shfl_down(selected_value, offset, 32);
         if (wave_lane < offset &&
             (other > maximum ||
              (other == maximum && other_index < maximum_index))) {
             maximum = other;
             maximum_index = other_index;
+            selected_value = other_value;
         }
     }
     if (wave_lane == 0) {
-        magnitudes[wave] = maximum;
-        indices[wave] = maximum_index;
+        values[wave] = selected_value;
     }
     __syncthreads();
     if (wave == 0) {
-        maximum = wave_lane < 8 ? magnitudes[wave_lane] : -1.0f;
-        maximum_index = wave_lane < 8 ? indices[wave_lane] : QK_K;
+        selected_value = wave_lane < 8 ? values[wave_lane] : 0.0f;
+        maximum = wave_lane < 8 ? fabsf(selected_value) : -1.0f;
+        maximum_index = wave_lane;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             const float other = __shfl_down(maximum, offset, 32);
             const int other_index = __shfl_down(maximum_index, offset, 32);
+            const float other_value = __shfl_down(selected_value, offset, 32);
             if (wave_lane < offset &&
                 (other > maximum ||
                  (other == maximum && other_index < maximum_index))) {
                 maximum = other;
                 maximum_index = other_index;
+                selected_value = other_value;
             }
         }
         if (wave_lane == 0) {
-            magnitudes[0] = maximum;
-            indices[0] = maximum_index;
+            values[0] = selected_value;
         }
     }
     __syncthreads();
-    if (magnitudes[0] == 0.0f) {
+    if (values[0] == 0.0f) {
         block.qs[lane] = 0;
         if (lane < QK_K / 16) block.bsums[lane] = 0;
         if (lane == 0) block.d = 0.0f;
         return;
     }
-    const float inverse_scale = __fdiv_rn(-127.0f, values[indices[0]]);
+    const float inverse_scale = __fdiv_rn(-127.0f, values[0]);
     const float scaled = __fmul_rn(inverse_scale, value);
     int quant = nearest_integer(scaled);
     if (quant > 127) quant = 127;
@@ -710,11 +706,11 @@ __device__ void quantize_q8_K_shared(float value, float* values,
     if (lane == 0) block.d = __fdiv_rn(1.0f, inverse_scale);
 }
 
-template <bool Activate>
+template <bool Activate, bool StoreActivated>
 __device__ void finish_ffn_activation(
     int tile_index, float* gate, float* up, float* activated,
     block_q8_K* activated_q8, int32_t* ready, float* activation_values,
-    float* activation_magnitudes, int* activation_indices, int* owner) {
+    int* owner) {
     if constexpr (!Activate) return;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -731,34 +727,26 @@ __device__ void finish_ffn_activation(
     const int index = activation_block * QK_K + (int)threadIdx.x;
     const float gate_value = gate[index];
     const float value = gate_value / (1.0f + expf(-gate_value)) * up[index];
-    activated[index] = value;
-    quantize_q8_K_shared(value, activation_values, activation_magnitudes,
-                         activation_indices, activated_q8[activation_block]);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        __threadfence();
-        atomicExch(ready + activation_block, 0);
-    }
+    if constexpr (StoreActivated) activated[index] = value;
+    quantize_q8_K_shared(value, activation_values,
+                         activated_q8[activation_block]);
+    if (threadIdx.x == 0) ready[activation_block] = 0;
 }
 
 __global__ __launch_bounds__(256)
 void quantize_q8_K_kernel(const float* input, block_q8_K* output) {
-    __shared__ float values[QK_K];
-    __shared__ float magnitudes[QK_K];
-    __shared__ int indices[QK_K];
+    __shared__ float values[Q8_K_REDUCTION_WAVES];
     const int lane = (int)threadIdx.x;
     const int offset = (int)blockIdx.x * QK_K + lane;
     const float value = input[offset];
-    quantize_q8_K_shared(value, values, magnitudes, indices, output[blockIdx.x]);
+    quantize_q8_K_shared(value, values, output[blockIdx.x]);
 }
 
 __global__ __launch_bounds__(256)
 void rms_norm_quantize_q8_K_kernel(const float* input, const float* weight,
                                    float* normalized, block_q8_K* output,
                                    int elements, float epsilon) {
-    __shared__ float values[QK_K];
-    __shared__ float magnitudes[QK_K];
-    __shared__ int indices[QK_K];
+    __shared__ float values[Q8_K_REDUCTION_WAVES];
     __shared__ float wave_sums[8];
     __shared__ float inverse_rms;
     const int lane = (int)threadIdx.x;
@@ -783,22 +771,20 @@ void rms_norm_quantize_q8_K_kernel(const float* input, const float* weight,
     __syncthreads();
     const int index = (int)blockIdx.x * QK_K + lane;
     const float value = input[index] * inverse_rms * weight[index];
-    normalized[index] = value;
-    quantize_q8_K_shared(value, values, magnitudes, indices, output[blockIdx.x]);
+    if (normalized) normalized[index] = value;
+    quantize_q8_K_shared(value, values, output[blockIdx.x]);
 }
 
 __global__ __launch_bounds__(256)
 void silu_multiply_quantize_q8_K_kernel(const float* gate, const float* up,
                                         float* activated, block_q8_K* output) {
-    __shared__ float values[QK_K];
-    __shared__ float magnitudes[QK_K];
-    __shared__ int indices[QK_K];
+    __shared__ float values[Q8_K_REDUCTION_WAVES];
     const int lane = (int)threadIdx.x;
     const int index = (int)blockIdx.x * QK_K + lane;
     const float gate_value = gate[index];
     const float value = gate_value / (1.0f + expf(-gate_value)) * up[index];
     activated[index] = value;
-    quantize_q8_K_shared(value, values, magnitudes, indices, output[blockIdx.x]);
+    quantize_q8_K_shared(value, values, output[blockIdx.x]);
 }
 
 template <int Type>
@@ -1067,9 +1053,7 @@ void gemv_q8_K_split_kernel(const uint8_t* weights, RepackLayout layout,
                             int32_t* norm_ready, float norm_epsilon) {
     constexpr int tiles_per_block = FuseNorm && KSplit == 4 ? 2 : 1;
     __shared__ float partial[KSplit * tiles_per_block * REPACK_ROW_TILE];
-    __shared__ float norm_values[FuseNorm ? QK_K : 1];
-    __shared__ float norm_magnitudes[FuseNorm ? QK_K : 1];
-    __shared__ int norm_indices[FuseNorm ? QK_K : 1];
+    __shared__ float norm_values[FuseNorm ? Q8_K_REDUCTION_WAVES : 1];
     __shared__ float norm_wave_sums[FuseNorm ? 8 : 1];
     __shared__ float norm_inverse_rms;
     const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
@@ -1131,7 +1115,6 @@ void gemv_q8_K_split_kernel(const uint8_t* weights, RepackLayout layout,
             __threadfence();
             atomicAdd(norm_ready, 1);
         }
-        __syncthreads();
         if ((int)blockIdx.x < (int)gridDim.x - norm_blocks) return;
         if (threadIdx.x == 0) {
             while (atomicAdd(norm_ready, 0) < (int)gridDim.x) {}
@@ -1165,23 +1148,20 @@ void gemv_q8_K_split_kernel(const uint8_t* weights, RepackLayout layout,
         const int index = norm_block * QK_K + thread;
         const float value =
             output[index] * norm_inverse_rms * norm_weight[index];
-        normalized[index] = value;
-        quantize_q8_K_shared(value, norm_values, norm_magnitudes, norm_indices,
-                             normalized_q8[norm_block]);
-        __syncthreads();
+        if (normalized) normalized[index] = value;
+        quantize_q8_K_shared(value, norm_values, normalized_q8[norm_block]);
         if (thread == 0) {
             const int old = atomicAdd(norm_ready + 1, 1);
             if (old == norm_blocks - 1) {
-                atomicExch(norm_ready, 0);
-                __threadfence();
-                atomicExch(norm_ready + 1, 0);
+                norm_ready[0] = 0;
+                norm_ready[1] = 0;
             }
         }
     }
 }
 
 template <int Type, int KSplit, bool UnrollBlocks, bool StreamAux,
-          bool Activate = false>
+          bool Activate = false, bool StoreActivated = false>
 __global__ __launch_bounds__(256, 2)
 void gemv_q8_K_pair_kernel(const uint8_t* first_weights,
                            const uint8_t* second_weights, RepackLayout layout,
@@ -1191,9 +1171,8 @@ void gemv_q8_K_pair_kernel(const uint8_t* first_weights,
                            float* activated, block_q8_K* activated_q8,
                            int32_t* ready) {
     __shared__ float partial[KSplit * REPACK_ROW_TILE];
-    __shared__ float activation_values[Activate ? QK_K : 1];
-    __shared__ float activation_magnitudes[Activate ? QK_K : 1];
-    __shared__ int activation_indices[Activate ? QK_K : 1];
+    __shared__ float activation_values[
+        Activate ? Q8_K_REDUCTION_WAVES : 1];
     __shared__ int activation_owner;
     const int first_tiles =
         (first_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
@@ -1247,10 +1226,9 @@ void gemv_q8_K_pair_kernel(const uint8_t* first_weights,
             total += partial[part * REPACK_ROW_TILE + lane];
         output[row] = total;
     }
-    finish_ffn_activation<Activate>(
+    finish_ffn_activation<Activate, StoreActivated>(
         tile_index, first_output, second_output, activated, activated_q8, ready,
-        activation_values, activation_magnitudes, activation_indices,
-        &activation_owner);
+        activation_values, &activation_owner);
 }
 
 template <int Type, bool StreamQ5>
@@ -1262,8 +1240,148 @@ __device__ float dot_q8_K_small_pair(const PackedBlockView& weight,
         return dot_q8_K_block<Type>(weight, activation);
 }
 
+template <int Type, int KSplit, bool UnrollBlocks>
+__device__ float attention_projection_sum(
+    const uint8_t* weights, RepackLayout layout,
+    const block_q8_K* input, int row, int tile_start, int tile_rows,
+    int split_wave, int elements_per_row) {
+    if (row < tile_start || row >= tile_start + tile_rows) return 0.0f;
+    const int blocks_per_row = elements_per_row / QK_K;
+    const size_t row_bytes = (size_t)blocks_per_row * layout.block_bytes;
+    const uint8_t* tile = weights + (size_t)tile_start * row_bytes;
+    float sum = 0.0f;
+    if constexpr (UnrollBlocks) {
+#pragma unroll 2
+        for (int block = split_wave; block < blocks_per_row;
+             block += KSplit) {
+            const PackedBlockView view = {
+                tile + (size_t)block * tile_rows * layout.block_bytes,
+                tile_rows, row - tile_start,
+            };
+            sum += dot_q8_K_small_pair<Type, false>(view, input[block]);
+        }
+    } else {
+        for (int block = split_wave; block < blocks_per_row;
+             block += KSplit) {
+            const PackedBlockView view = {
+                tile + (size_t)block * tile_rows * layout.block_bytes,
+                tile_rows, row - tile_start,
+            };
+            sum += dot_q8_K_small_pair<Type, false>(view, input[block]);
+        }
+    }
+    return sum;
+}
+
+template <int Type, int KSplit>
+__device__ float attention_f32_projection_sum(
+    const uint8_t* weights, RepackLayout layout, const float* input, int row,
+    int tile_start, int tile_rows, int split_wave, int elements_per_row) {
+    if (row < tile_start || row >= tile_start + tile_rows) return 0.0f;
+    const int blocks_per_row = elements_per_row / layout.block_elements;
+    const size_t row_bytes = (size_t)blocks_per_row * layout.block_bytes;
+    const uint8_t* tile = weights + (size_t)tile_start * row_bytes;
+    float sum = 0.0f;
+    for (int block = split_wave; block < blocks_per_row; block += KSplit) {
+        const PackedBlockView view = {
+            tile + (size_t)block * tile_rows * layout.block_bytes,
+            tile_rows, row - tile_start,
+        };
+        sum += dot_quant_block<Type>(
+            view, input + (size_t)block * layout.block_elements);
+    }
+    return sum;
+}
+
+template <int FirstType, int SecondType, int ThirdType>
+__global__ __launch_bounds__(256, 2)
+void gemv_q8_K_compatible_triple_kernel(
+    const uint8_t* first_weights, const uint8_t* second_weights,
+    const uint8_t* third_weights, RepackLayout first_layout,
+    RepackLayout second_layout, RepackLayout third_layout,
+    const block_q8_K* input, const float* f32_input, float* first_output,
+    float* second_output, float* third_output, int first_rows,
+    int second_rows, int third_rows, int elements_per_row) {
+    constexpr int first_split =
+        FirstType == NS_Q4_K || FirstType == NS_Q5_K ? 4 : 8;
+    constexpr int second_split =
+        SecondType == NS_Q4_K || SecondType == NS_Q5_K ? 4 : 8;
+    constexpr int third_split =
+        ThirdType == NS_Q4_K || ThirdType == NS_Q5_K ? 4 : 8;
+    constexpr int first_tiles_per_block = 8 / first_split;
+    constexpr int second_tiles_per_block = 8 / second_split;
+    constexpr int third_tiles_per_block = 8 / third_split;
+    __shared__ float partial[8 * REPACK_ROW_TILE];
+    const int first_tiles =
+        (first_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int second_tiles =
+        (second_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
+    const int second_groups =
+        (second_tiles + second_tiles_per_block - 1) / second_tiles_per_block;
+    const int block = (int)blockIdx.x;
+    const int tensor = block < first_groups
+        ? 0 : (block < first_groups + second_groups ? 1 : 2);
+    const int group_index = tensor == 0
+        ? block : (tensor == 1 ? block - first_groups
+                               : block - first_groups - second_groups);
+    const int k_split = tensor == 0
+        ? first_split : (tensor == 1 ? second_split : third_split);
+    const int tiles_per_block = tensor == 0
+        ? first_tiles_per_block
+        : (tensor == 1 ? second_tiles_per_block : third_tiles_per_block);
+    const int rows = tensor == 0
+        ? first_rows : (tensor == 1 ? second_rows : third_rows);
+    const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
+    const int lane = (int)threadIdx.x % REPACK_ROW_TILE;
+    const int split_wave = wave % k_split;
+    const int tile_index = group_index * tiles_per_block + wave / k_split;
+    const int tile_start = tile_index * REPACK_ROW_TILE;
+    const int row = tile_start + lane;
+    const int tile_rows = rows - tile_start < REPACK_ROW_TILE
+                              ? rows - tile_start : REPACK_ROW_TILE;
+    float sum = 0.0f;
+    if (row < rows) {
+        if (tensor == 0)
+            sum = attention_projection_sum<FirstType, first_split,
+                FirstType == NS_Q6_K>(
+                    first_weights, first_layout, input, row, tile_start,
+                    tile_rows, split_wave, elements_per_row);
+        else if (tensor == 1)
+            sum = attention_projection_sum<SecondType, second_split,
+                SecondType == NS_Q6_K>(
+                    second_weights, second_layout, input, row, tile_start,
+                    tile_rows, split_wave, elements_per_row);
+        else {
+            if constexpr (ThirdType == NS_Q8_0)
+                sum = attention_f32_projection_sum<NS_Q8_0, third_split>(
+                    third_weights, third_layout, f32_input, row, tile_start,
+                    tile_rows, split_wave, elements_per_row);
+            else
+                sum = attention_projection_sum<ThirdType, third_split,
+                    ThirdType == NS_Q6_K>(
+                        third_weights, third_layout, input, row, tile_start,
+                        tile_rows, split_wave, elements_per_row);
+        }
+    }
+    partial[wave * REPACK_ROW_TILE + lane] = sum;
+    __syncthreads();
+    if (split_wave == 0 && row < rows) {
+        const int base_wave = wave - split_wave;
+        float total = partial[base_wave * REPACK_ROW_TILE + lane];
+#pragma unroll
+        for (int part = 1; part < k_split; part++)
+            total += partial[(base_wave + part) * REPACK_ROW_TILE + lane];
+        float* output = tensor == 0
+            ? first_output : (tensor == 1 ? second_output : third_output);
+        output[row] = total;
+    }
+}
+
 template <int FirstType, int SecondType, int FirstSplit, int SecondSplit,
-          bool UnrollBlocks, bool StreamQ5, bool Activate = false>
+          bool UnrollBlocks, bool StreamQ5, bool Activate = false,
+          bool StoreActivated = false>
 __global__ __launch_bounds__(8 * REPACK_ROW_TILE, 2)
 void gemv_q8_K_compatible_pair_kernel(
     const uint8_t* first_weights, const uint8_t* second_weights,
@@ -1274,9 +1392,8 @@ void gemv_q8_K_compatible_pair_kernel(
     constexpr int max_split = FirstSplit > SecondSplit
                                   ? FirstSplit : SecondSplit;
     __shared__ float partial[max_split * REPACK_ROW_TILE];
-    __shared__ float activation_values[Activate ? QK_K : 1];
-    __shared__ float activation_magnitudes[Activate ? QK_K : 1];
-    __shared__ int activation_indices[Activate ? QK_K : 1];
+    __shared__ float activation_values[
+        Activate ? Q8_K_REDUCTION_WAVES : 1];
     __shared__ int activation_owner;
     const int first_tiles =
         (first_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
@@ -1338,10 +1455,71 @@ void gemv_q8_K_compatible_pair_kernel(
             total += partial[part * REPACK_ROW_TILE + lane];
         output[row] = total;
     }
-    finish_ffn_activation<Activate>(
+    finish_ffn_activation<Activate, StoreActivated>(
         tile_index, first_output, second_output, activated, activated_q8, ready,
-        activation_values, activation_magnitudes, activation_indices,
-        &activation_owner);
+        activation_values, &activation_owner);
+}
+
+template <int QuantType, int F32Type, bool QuantIsFirst, bool StreamQ5,
+          bool StoreActivated>
+__global__ __launch_bounds__(256, 2)
+void gemv_mixed_pair_activate_kernel(
+    const uint8_t* first_weights, const uint8_t* second_weights,
+    RepackLayout first_layout, RepackLayout second_layout,
+    const block_q8_K* q8_input, const float* f32_input, float* first_output,
+    float* second_output, int rows, int elements_per_row, float* activated,
+    block_q8_K* activated_q8, int32_t* ready) {
+    __shared__ float partial[8 * REPACK_ROW_TILE];
+    __shared__ float activation_values[Q8_K_REDUCTION_WAVES];
+    __shared__ int activation_owner;
+    const int tiles = (rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const bool second = (int)blockIdx.x >= tiles;
+    const bool quant = second != QuantIsFirst;
+    const int tile_index = (int)blockIdx.x - (second ? tiles : 0);
+    const uint8_t* weights = second ? second_weights : first_weights;
+    const RepackLayout layout = second ? second_layout : first_layout;
+    float* output = second ? second_output : first_output;
+    const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
+    const int lane = (int)threadIdx.x % REPACK_ROW_TILE;
+    const int tile_start = tile_index * REPACK_ROW_TILE;
+    const int row = tile_start + lane;
+    const int tile_rows = rows - tile_start < REPACK_ROW_TILE
+                              ? rows - tile_start : REPACK_ROW_TILE;
+    float sum = 0.0f;
+    if (row < rows) {
+        const int blocks_per_row = elements_per_row / layout.block_elements;
+        const size_t row_bytes =
+            (size_t)blocks_per_row * layout.block_bytes;
+        const uint8_t* tile = weights + (size_t)tile_start * row_bytes;
+#pragma unroll 2
+        for (int block = wave; block < blocks_per_row; block += 8) {
+            const PackedBlockView view = {
+                tile + (size_t)block * tile_rows * layout.block_bytes,
+                tile_rows, lane,
+            };
+            if (quant) {
+                if constexpr (QuantType == NS_Q5_K)
+                    sum += dot_q8_K_block_q5<StreamQ5>(view, q8_input[block]);
+                else
+                    sum += dot_q8_K_block<QuantType>(view, q8_input[block]);
+            } else {
+                sum += dot_quant_block<F32Type>(
+                    view, f32_input + (size_t)block * layout.block_elements);
+            }
+        }
+    }
+    partial[wave * REPACK_ROW_TILE + lane] = sum;
+    __syncthreads();
+    if (wave == 0 && row < rows) {
+        float total = partial[lane];
+#pragma unroll
+        for (int part = 1; part < 8; part++)
+            total += partial[part * REPACK_ROW_TILE + lane];
+        output[row] = total;
+    }
+    finish_ffn_activation<true, StoreActivated>(
+        tile_index, first_output, second_output, activated, activated_q8, ready,
+        activation_values, &activation_owner);
 }
 
 template <int FirstType, int SecondType, int FirstSplit, int SecondSplit,
@@ -1475,6 +1653,123 @@ void gemv_q8_K_pair_f32_pair_kernel(
 
 template <int FirstType, int FirstSplit, bool UnrollBlocks, bool StreamQ5>
 __global__ __launch_bounds__(256, 2)
+void gemv_q8_K_f32_triple_kernel(
+    const uint8_t* first_weights, RepackLayout first_layout,
+    const block_q8_K* q8_input, float* first_output, int first_rows,
+    const uint8_t* second_weights, RepackLayout second_layout,
+    float* second_output, int second_rows, const uint8_t* third_weights,
+    const uint8_t* fourth_weights, RepackLayout scalar_layout,
+    const float* f32_input, float* third_output, float* fourth_output,
+    int scalar_rows, int elements_per_row) {
+    __shared__ float partial[8 * REPACK_ROW_TILE];
+    constexpr int first_tiles_per_block = 8 / FirstSplit;
+    const int first_tiles =
+        (first_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
+    const int second_tiles =
+        (second_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int scalar_tiles =
+        (scalar_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
+    const int lane = (int)threadIdx.x % REPACK_ROW_TILE;
+
+    if ((int)blockIdx.x < first_groups) {
+        const int split_wave = wave % FirstSplit;
+        const int tile_index =
+            (int)blockIdx.x * first_tiles_per_block + wave / FirstSplit;
+        const int tile_start = tile_index * REPACK_ROW_TILE;
+        const int row = tile_start + lane;
+        const int tile_rows = first_rows - tile_start < REPACK_ROW_TILE
+                                  ? first_rows - tile_start : REPACK_ROW_TILE;
+        float sum = 0.0f;
+        if (row < first_rows) {
+            const int blocks_per_row = elements_per_row / QK_K;
+            const size_t row_bytes =
+                (size_t)blocks_per_row * first_layout.block_bytes;
+            const uint8_t* tile =
+                first_weights + (size_t)tile_start * row_bytes;
+            if constexpr (UnrollBlocks) {
+#pragma unroll 2
+                for (int block = split_wave; block < blocks_per_row;
+                     block += FirstSplit) {
+                    const PackedBlockView view = {
+                        tile + (size_t)block * tile_rows *
+                                   first_layout.block_bytes,
+                        tile_rows, lane,
+                    };
+                    sum += dot_q8_K_small_pair<FirstType, StreamQ5>(
+                        view, q8_input[block]);
+                }
+            } else {
+                for (int block = split_wave; block < blocks_per_row;
+                     block += FirstSplit) {
+                    const PackedBlockView view = {
+                        tile + (size_t)block * tile_rows *
+                                   first_layout.block_bytes,
+                        tile_rows, lane,
+                    };
+                    sum += dot_q8_K_small_pair<FirstType, StreamQ5>(
+                        view, q8_input[block]);
+                }
+            }
+        }
+        partial[wave * REPACK_ROW_TILE + lane] = sum;
+        __syncthreads();
+        if (split_wave == 0 && row < first_rows) {
+            const int base_wave = wave - split_wave;
+            float total = partial[base_wave * REPACK_ROW_TILE + lane];
+#pragma unroll
+            for (int part = 1; part < FirstSplit; part++)
+                total += partial[(base_wave + part) * REPACK_ROW_TILE + lane];
+            first_output[row] = total;
+        }
+        return;
+    }
+
+    const int f32_block = (int)blockIdx.x - first_groups;
+    const bool scalar = f32_block >= second_tiles;
+    const int scalar_block = f32_block - (scalar ? second_tiles : 0);
+    const bool fourth = scalar && scalar_block >= scalar_tiles;
+    const int tile_index = scalar
+        ? scalar_block - (fourth ? scalar_tiles : 0) : scalar_block;
+    const int rows = scalar ? scalar_rows : second_rows;
+    const int tile_start = tile_index * REPACK_ROW_TILE;
+    const int row = tile_start + lane;
+    const int tile_rows = rows - tile_start < REPACK_ROW_TILE
+                              ? rows - tile_start : REPACK_ROW_TILE;
+    const RepackLayout layout = scalar ? scalar_layout : second_layout;
+    const uint8_t* weights = scalar
+        ? (fourth ? fourth_weights : third_weights) : second_weights;
+    float sum = 0.0f;
+    if (row < rows) {
+        const int blocks_per_row = elements_per_row / layout.block_elements;
+        const size_t row_bytes =
+            (size_t)blocks_per_row * layout.block_bytes;
+        const uint8_t* tile = weights + (size_t)tile_start * row_bytes;
+        for (int block = wave; block < blocks_per_row; block += 8) {
+            const PackedBlockView view = {
+                tile + (size_t)block * tile_rows * layout.block_bytes,
+                tile_rows, lane,
+            };
+            sum += dot_quant_block<NS_Q8_0>(
+                view, f32_input + (size_t)block * layout.block_elements);
+        }
+    }
+    partial[wave * REPACK_ROW_TILE + lane] = sum;
+    __syncthreads();
+    if (wave == 0 && row < rows) {
+        float total = partial[lane];
+#pragma unroll
+        for (int part = 1; part < 8; part++)
+            total += partial[part * REPACK_ROW_TILE + lane];
+        if (!scalar) second_output[row] = total;
+        else (fourth ? fourth_output : third_output)[row] = total;
+    }
+}
+
+template <int FirstType, int FirstSplit, bool UnrollBlocks, bool StreamQ5>
+__global__ __launch_bounds__(256, 2)
 void gemv_q8_K_f32_pair_kernel(
     const uint8_t* first_weights, RepackLayout first_layout,
     const block_q8_K* q8_input, float* first_output, int first_rows,
@@ -1482,15 +1777,18 @@ void gemv_q8_K_f32_pair_kernel(
     RepackLayout f32_layout, const float* f32_input, float* second_output,
     float* third_output, int scalar_rows, int elements_per_row) {
     __shared__ float partial[8 * REPACK_ROW_TILE];
+    constexpr int first_tiles_per_block = 8 / FirstSplit;
     const int first_tiles =
         (first_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
     const int wave = (int)threadIdx.x / REPACK_ROW_TILE;
     const int lane = (int)threadIdx.x % REPACK_ROW_TILE;
 
-    if ((int)blockIdx.x >= first_tiles) {
+    if ((int)blockIdx.x >= first_groups) {
         const int scalar_tiles =
             (scalar_rows + REPACK_ROW_TILE - 1) / REPACK_ROW_TILE;
-        const int scalar_block = (int)blockIdx.x - first_tiles;
+        const int scalar_block = (int)blockIdx.x - first_groups;
         const bool third = scalar_block >= scalar_tiles;
         const int tile_index = scalar_block - (third ? scalar_tiles : 0);
         const int tile_start = tile_index * REPACK_ROW_TILE;
@@ -1527,12 +1825,15 @@ void gemv_q8_K_f32_pair_kernel(
         return;
     }
 
-    const int tile_start = (int)blockIdx.x * REPACK_ROW_TILE;
+    const int split_wave = wave % FirstSplit;
+    const int tile_index =
+        (int)blockIdx.x * first_tiles_per_block + wave / FirstSplit;
+    const int tile_start = tile_index * REPACK_ROW_TILE;
     const int row = tile_start + lane;
     const int tile_rows = first_rows - tile_start < REPACK_ROW_TILE
                               ? first_rows - tile_start : REPACK_ROW_TILE;
     float sum = 0.0f;
-    if (row < first_rows && wave < FirstSplit) {
+    if (row < first_rows) {
         const int blocks_per_row = elements_per_row / QK_K;
         const size_t row_bytes =
             (size_t)blocks_per_row * first_layout.block_bytes;
@@ -1540,7 +1841,7 @@ void gemv_q8_K_f32_pair_kernel(
             first_weights + (size_t)tile_start * row_bytes;
         if constexpr (UnrollBlocks) {
 #pragma unroll 2
-            for (int block = wave; block < blocks_per_row;
+            for (int block = split_wave; block < blocks_per_row;
                  block += FirstSplit) {
                 const PackedBlockView view = {
                     tile + (size_t)block * tile_rows * first_layout.block_bytes,
@@ -1550,7 +1851,7 @@ void gemv_q8_K_f32_pair_kernel(
                     view, q8_input[block]);
             }
         } else {
-            for (int block = wave; block < blocks_per_row;
+            for (int block = split_wave; block < blocks_per_row;
                  block += FirstSplit) {
                 const PackedBlockView view = {
                     tile + (size_t)block * tile_rows * first_layout.block_bytes,
@@ -1563,11 +1864,12 @@ void gemv_q8_K_f32_pair_kernel(
     }
     partial[wave * REPACK_ROW_TILE + lane] = sum;
     __syncthreads();
-    if (wave == 0 && row < first_rows) {
-        float total = partial[lane];
+    if (split_wave == 0 && row < first_rows) {
+        const int base_wave = wave - split_wave;
+        float total = partial[base_wave * REPACK_ROW_TILE + lane];
 #pragma unroll
         for (int part = 1; part < FirstSplit; part++)
-            total += partial[part * REPACK_ROW_TILE + lane];
+            total += partial[(base_wave + part) * REPACK_ROW_TILE + lane];
         first_output[row] = total;
     }
 }
@@ -1684,13 +1986,34 @@ static void launch_q8_K_pair(const GpuTensor& first, const GpuTensor& second,
                             REPACK_ROW_TILE;
     const int second_tiles = ((int)second.ne[1] + REPACK_ROW_TILE - 1) /
                              REPACK_ROW_TILE;
-    hipLaunchKernelGGL(
-        (gemv_q8_K_pair_kernel<Type, KSplit, UnrollBlocks, StreamAux,
-                               Activate>),
-        dim3((uint32_t)(first_tiles + second_tiles)),
-        dim3(KSplit * REPACK_ROW_TILE), 0, stream, first.data, second.data,
-        first.layout, input, first_output, second_output, (int)first.ne[1],
-        (int)second.ne[1], (int)first.ne[0], activated, activated_q8, ready);
+    const dim3 grid((uint32_t)(first_tiles + second_tiles));
+    const dim3 block(KSplit * REPACK_ROW_TILE);
+    if constexpr (Activate) {
+        if (activated)
+            hipLaunchKernelGGL(
+                (gemv_q8_K_pair_kernel<Type, KSplit, UnrollBlocks, StreamAux,
+                                       true, true>),
+                grid, block, 0, stream, first.data, second.data, first.layout,
+                input, first_output, second_output, (int)first.ne[1],
+                (int)second.ne[1], (int)first.ne[0], activated, activated_q8,
+                ready);
+        else
+            hipLaunchKernelGGL(
+                (gemv_q8_K_pair_kernel<Type, KSplit, UnrollBlocks, StreamAux,
+                                       true, false>),
+                grid, block, 0, stream, first.data, second.data, first.layout,
+                input, first_output, second_output, (int)first.ne[1],
+                (int)second.ne[1], (int)first.ne[0], activated, activated_q8,
+                ready);
+    } else {
+        hipLaunchKernelGGL(
+            (gemv_q8_K_pair_kernel<Type, KSplit, UnrollBlocks, StreamAux,
+                                   false, false>),
+            grid, block, 0, stream, first.data, second.data, first.layout,
+            input, first_output, second_output, (int)first.ne[1],
+            (int)second.ne[1], (int)first.ne[0], activated, activated_q8,
+            ready);
+    }
 }
 
 template <int FirstType, int SecondType,
@@ -1709,15 +2032,106 @@ static void launch_q8_K_compatible_pair(
                              REPACK_ROW_TILE;
     constexpr int max_split = FirstSplit > SecondSplit
                                   ? FirstSplit : SecondSplit;
-    hipLaunchKernelGGL((gemv_q8_K_compatible_pair_kernel<
-                           FirstType, SecondType, FirstSplit, SecondSplit,
-                           UnrollBlocks, StreamQ5, Activate>),
-                       dim3((uint32_t)(first_tiles + second_tiles)),
-                       dim3(max_split * REPACK_ROW_TILE), 0, stream, first.data,
-                       second.data, first.layout, second.layout, input,
-                       first_output, second_output, (int)first.ne[1],
-                       (int)second.ne[1], (int)first.ne[0], activated,
-                       activated_q8, ready);
+    const dim3 grid((uint32_t)(first_tiles + second_tiles));
+    const dim3 block(max_split * REPACK_ROW_TILE);
+    if constexpr (Activate) {
+        if (activated)
+            hipLaunchKernelGGL((gemv_q8_K_compatible_pair_kernel<
+                                   FirstType, SecondType, FirstSplit,
+                                   SecondSplit, UnrollBlocks, StreamQ5, true,
+                                   true>),
+                               grid, block, 0, stream, first.data, second.data,
+                               first.layout, second.layout, input, first_output,
+                               second_output, (int)first.ne[1],
+                               (int)second.ne[1], (int)first.ne[0], activated,
+                               activated_q8, ready);
+        else
+            hipLaunchKernelGGL((gemv_q8_K_compatible_pair_kernel<
+                                   FirstType, SecondType, FirstSplit,
+                                   SecondSplit, UnrollBlocks, StreamQ5, true,
+                                   false>),
+                               grid, block, 0, stream, first.data, second.data,
+                               first.layout, second.layout, input, first_output,
+                               second_output, (int)first.ne[1],
+                               (int)second.ne[1], (int)first.ne[0], activated,
+                               activated_q8, ready);
+    } else {
+        hipLaunchKernelGGL((gemv_q8_K_compatible_pair_kernel<
+                               FirstType, SecondType, FirstSplit, SecondSplit,
+                               UnrollBlocks, StreamQ5, false, false>),
+                           grid, block, 0, stream, first.data, second.data,
+                           first.layout, second.layout, input, first_output,
+                           second_output, (int)first.ne[1], (int)second.ne[1],
+                           (int)first.ne[0], activated, activated_q8, ready);
+    }
+}
+
+template <int FirstType, int SecondType, int ThirdType>
+static void launch_q8_K_compatible_triple(
+    const GpuTensor& first, const GpuTensor& second, const GpuTensor& third,
+    const block_q8_K* input, const float* f32_input, float* first_output,
+    float* second_output, float* third_output, hipStream_t stream) {
+    constexpr int first_split =
+        FirstType == NS_Q4_K || FirstType == NS_Q5_K ? 4 : 8;
+    constexpr int second_split =
+        SecondType == NS_Q4_K || SecondType == NS_Q5_K ? 4 : 8;
+    constexpr int third_split =
+        ThirdType == NS_Q4_K || ThirdType == NS_Q5_K ? 4 : 8;
+    constexpr int first_tiles_per_block = 8 / first_split;
+    constexpr int second_tiles_per_block = 8 / second_split;
+    constexpr int third_tiles_per_block = 8 / third_split;
+    const int first_tiles = ((int)first.ne[1] + REPACK_ROW_TILE - 1) /
+                            REPACK_ROW_TILE;
+    const int second_tiles = ((int)second.ne[1] + REPACK_ROW_TILE - 1) /
+                             REPACK_ROW_TILE;
+    const int third_tiles = ((int)third.ne[1] + REPACK_ROW_TILE - 1) /
+                            REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
+    const int second_groups =
+        (second_tiles + second_tiles_per_block - 1) /
+        second_tiles_per_block;
+    const int third_groups =
+        (third_tiles + third_tiles_per_block - 1) / third_tiles_per_block;
+    hipLaunchKernelGGL((gemv_q8_K_compatible_triple_kernel<
+                           FirstType, SecondType, ThirdType>),
+                       dim3((uint32_t)(first_groups + second_groups +
+                                       third_groups)),
+                       dim3(8 * REPACK_ROW_TILE), 0, stream, first.data,
+                       second.data, third.data, first.layout, second.layout,
+                       third.layout, input, f32_input, first_output,
+                       second_output, third_output, (int)first.ne[1],
+                       (int)second.ne[1], (int)third.ne[1], (int)first.ne[0]);
+}
+
+template <int QuantType, int F32Type, bool QuantIsFirst, bool StreamQ5>
+static void launch_mixed_pair_activate(
+    const GpuTensor& first, const GpuTensor& second,
+    const block_q8_K* q8_input, const float* f32_input, float* first_output,
+    float* second_output, float* activated, block_q8_K* activated_q8,
+    int32_t* ready, hipStream_t stream) {
+    const int tiles = ((int)first.ne[1] + REPACK_ROW_TILE - 1) /
+                      REPACK_ROW_TILE;
+    if (activated)
+        hipLaunchKernelGGL((gemv_mixed_pair_activate_kernel<
+                               QuantType, F32Type, QuantIsFirst, StreamQ5,
+                               true>),
+                           dim3((uint32_t)(2 * tiles)),
+                           dim3(8 * REPACK_ROW_TILE), 0, stream, first.data,
+                           second.data, first.layout, second.layout, q8_input,
+                           f32_input, first_output, second_output,
+                           (int)first.ne[1], (int)first.ne[0], activated,
+                           activated_q8, ready);
+    else
+        hipLaunchKernelGGL((gemv_mixed_pair_activate_kernel<
+                               QuantType, F32Type, QuantIsFirst, StreamQ5,
+                               false>),
+                           dim3((uint32_t)(2 * tiles)),
+                           dim3(8 * REPACK_ROW_TILE), 0, stream, first.data,
+                           second.data, first.layout, second.layout, q8_input,
+                           f32_input, first_output, second_output,
+                           (int)first.ne[1], (int)first.ne[0], activated,
+                           activated_q8, ready);
 }
 
 template <int FirstType, int SecondType, int FirstSplit, int SecondSplit,
@@ -1753,17 +2167,47 @@ static void launch_q8_K_pair_f32_pair(
 }
 
 template <int FirstType, int FirstSplit, bool UnrollBlocks, bool StreamQ5>
+static void launch_q8_K_f32_triple(
+    const GpuTensor& first, const block_q8_K* q8_input, float* first_output,
+    const GpuTensor& second, const GpuTensor& third, const GpuTensor& fourth,
+    const float* f32_input, float* second_output, float* third_output,
+    float* fourth_output, hipStream_t stream) {
+    constexpr int first_tiles_per_block = 8 / FirstSplit;
+    const int first_tiles = ((int)first.ne[1] + REPACK_ROW_TILE - 1) /
+                            REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
+    const int second_tiles = ((int)second.ne[1] + REPACK_ROW_TILE - 1) /
+                             REPACK_ROW_TILE;
+    const int scalar_tiles = ((int)third.ne[1] + REPACK_ROW_TILE - 1) /
+                             REPACK_ROW_TILE;
+    hipLaunchKernelGGL((gemv_q8_K_f32_triple_kernel<
+                           FirstType, FirstSplit, UnrollBlocks, StreamQ5>),
+                       dim3((uint32_t)(first_groups + second_tiles +
+                                       2 * scalar_tiles)),
+                       dim3(8 * REPACK_ROW_TILE), 0, stream, first.data,
+                       first.layout, q8_input, first_output, (int)first.ne[1],
+                       second.data, second.layout, second_output,
+                       (int)second.ne[1], third.data, fourth.data, third.layout,
+                       f32_input, third_output, fourth_output, (int)third.ne[1],
+                       (int)first.ne[0]);
+}
+
+template <int FirstType, int FirstSplit, bool UnrollBlocks, bool StreamQ5>
 static void launch_q8_K_f32_pair(
     const GpuTensor& first, const block_q8_K* q8_input, float* first_output,
     const GpuTensor& second, const GpuTensor& third, const float* f32_input,
     float* second_output, float* third_output, hipStream_t stream) {
+    constexpr int first_tiles_per_block = 8 / FirstSplit;
     const int first_tiles = ((int)first.ne[1] + REPACK_ROW_TILE - 1) /
                             REPACK_ROW_TILE;
+    const int first_groups =
+        (first_tiles + first_tiles_per_block - 1) / first_tiles_per_block;
     const int scalar_tiles = ((int)second.ne[1] + REPACK_ROW_TILE - 1) /
                              REPACK_ROW_TILE;
     hipLaunchKernelGGL((gemv_q8_K_f32_pair_kernel<
                            FirstType, FirstSplit, UnrollBlocks, StreamQ5>),
-                       dim3((uint32_t)(first_tiles + 2 * scalar_tiles)),
+                       dim3((uint32_t)(first_groups + 2 * scalar_tiles)),
                        dim3(8 * REPACK_ROW_TILE), 0, stream, first.data,
                        first.layout, q8_input, first_output, (int)first.ne[1],
                        second.data, third.data, second.layout, f32_input,
@@ -1855,7 +2299,7 @@ bool gpu_gemv_f32_add_norm(
     const float* norm_weight, float* normalized, block_q8_K* normalized_q8,
     int32_t* ready, float epsilon, hipStream_t stream, std::string* error) {
     if (!gpu_gemv_f32_add_norm_supported(tensor) || !tensor.data || !input ||
-        !destination || !norm_weight || !normalized || !normalized_q8 || !ready ||
+        !destination || !norm_weight || !normalized_q8 || !ready ||
         epsilon < 0.0f || !stream) {
         if (error) *error = "invalid fused fp32 residual GEMV/RMSNorm arguments";
         return false;
@@ -1918,7 +2362,7 @@ bool gpu_rms_norm_quantize_q8_K(const float* input, const float* weight,
                                 float* normalized, block_q8_K* output,
                                 int64_t elements, float epsilon,
                                 hipStream_t stream, std::string* error) {
-    if (!input || !weight || !normalized || !output || !stream || elements <= 0 ||
+    if (!input || !weight || !output || !stream || elements <= 0 ||
         elements % QK_K != 0 || elements > INT32_MAX || epsilon < 0.0f) {
         if (error) *error = "invalid fused RMSNorm-Q8_K arguments";
         return false;
@@ -2038,6 +2482,62 @@ bool gpu_gemv_q8_K_pair_supported(const GpuTensor& first,
            (q4_q5 || iq_q5 || iq_q4 || iq_q3 || q5_q6);
 }
 
+bool gpu_gemv_q8_K_triple_supported(const GpuTensor& first,
+                                    const GpuTensor& second,
+                                    const GpuTensor& third) {
+    if (first.n_dims != 2 || second.n_dims != 2 || third.n_dims != 2 ||
+        first.ne[0] != 5120 || second.ne[0] != first.ne[0] ||
+        third.ne[0] != first.ne[0] || first.ne[1] != 12288 ||
+        second.ne[1] != 1024 || third.ne[1] != second.ne[1])
+        return false;
+    const bool q6_q6_q5 = first.type == NS_Q6_K &&
+        second.type == NS_Q6_K && third.type == NS_Q5_K;
+    const bool q6_q5_q5 = first.type == NS_Q6_K &&
+        second.type == NS_Q5_K && third.type == NS_Q5_K;
+    const bool q5_q6_q6 = first.type == NS_Q5_K &&
+        second.type == NS_Q6_K && third.type == NS_Q6_K;
+    const bool q5_q6_q8 = first.type == NS_Q5_K &&
+        second.type == NS_Q6_K && third.type == NS_Q8_0;
+    const bool q4_q6_q8 = first.type == NS_Q4_K &&
+        second.type == NS_Q6_K && third.type == NS_Q8_0;
+    return q6_q6_q5 || q6_q5_q5 || q5_q6_q6 || q5_q6_q8 || q4_q6_q8;
+}
+
+bool gpu_gemv_q8_K_triple(
+    const GpuTensor& first, const GpuTensor& second, const GpuTensor& third,
+    const block_q8_K* input, const float* f32_input, float* first_output,
+    float* second_output, float* third_output, hipStream_t stream,
+    std::string* error) {
+    if (!gpu_gemv_q8_K_triple_supported(first, second, third) ||
+        !first.data || !second.data || !third.data || !input || !f32_input ||
+        !first_output || !second_output || !third_output || !stream) {
+        if (error) *error = "invalid compatible attention triple arguments";
+        return false;
+    }
+    if (first.type == NS_Q6_K && second.type == NS_Q6_K)
+        launch_q8_K_compatible_triple<NS_Q6_K, NS_Q6_K, NS_Q5_K>(
+            first, second, third, input, f32_input, first_output, second_output,
+            third_output, stream);
+    else if (first.type == NS_Q6_K)
+        launch_q8_K_compatible_triple<NS_Q6_K, NS_Q5_K, NS_Q5_K>(
+            first, second, third, input, f32_input, first_output, second_output,
+            third_output, stream);
+    else if (third.type == NS_Q6_K)
+        launch_q8_K_compatible_triple<NS_Q5_K, NS_Q6_K, NS_Q6_K>(
+            first, second, third, input, f32_input, first_output, second_output,
+            third_output, stream);
+    else if (first.type == NS_Q5_K)
+        launch_q8_K_compatible_triple<NS_Q5_K, NS_Q6_K, NS_Q8_0>(
+            first, second, third, input, f32_input, first_output, second_output,
+            third_output, stream);
+    else
+        launch_q8_K_compatible_triple<NS_Q4_K, NS_Q6_K, NS_Q8_0>(
+            first, second, third, input, f32_input, first_output, second_output,
+            third_output, stream);
+    return hip_result(hipGetLastError(),
+                      "launch compatible attention triple", error);
+}
+
 bool gpu_gemv_q8_K_pair_f32_pair_supported(const GpuTensor& first,
                                            const GpuTensor& second,
                                            const GpuTensor& third,
@@ -2143,6 +2643,48 @@ bool gpu_gemv_q8_K_pair_f32_pair(
     return hip_result(hipGetLastError(), "launch paired GDN projections", error);
 }
 
+bool gpu_gemv_q8_K_f32_triple_supported(const GpuTensor& first,
+                                        const GpuTensor& second,
+                                        const GpuTensor& third,
+                                        const GpuTensor& fourth) {
+    return first.n_dims == 2 && second.n_dims == 2 && third.n_dims == 2 &&
+           fourth.n_dims == 2 &&
+           (first.type == NS_Q5_K || first.type == NS_Q6_K) &&
+           first.ne[0] == 5120 && first.ne[1] == 10240 &&
+           second.type == NS_Q8_0 && second.ne[0] == first.ne[0] &&
+           second.ne[1] == 6144 && third.type == NS_Q8_0 &&
+           fourth.type == NS_Q8_0 && third.ne[0] == first.ne[0] &&
+           fourth.ne[0] == first.ne[0] && third.ne[1] == 48 &&
+           fourth.ne[1] == third.ne[1] &&
+           second.layout.block_elements == third.layout.block_elements &&
+           second.layout.block_bytes == third.layout.block_bytes &&
+           third.layout.block_elements == fourth.layout.block_elements &&
+           third.layout.block_bytes == fourth.layout.block_bytes;
+}
+
+bool gpu_gemv_q8_K_f32_triple(
+    const GpuTensor& first, const block_q8_K* q8_input, float* first_output,
+    const GpuTensor& second, const GpuTensor& third, const GpuTensor& fourth,
+    const float* f32_input, float* second_output, float* third_output,
+    float* fourth_output, hipStream_t stream, std::string* error) {
+    if (!gpu_gemv_q8_K_f32_triple_supported(first, second, third, fourth) ||
+        !first.data || !second.data || !third.data || !fourth.data ||
+        !q8_input || !first_output || !f32_input || !second_output ||
+        !third_output || !fourth_output || !stream) {
+        if (error) *error = "invalid mixed GDN projection arguments";
+        return false;
+    }
+    if (first.type == NS_Q5_K)
+        launch_q8_K_f32_triple<NS_Q5_K, 4, false, false>(
+            first, q8_input, first_output, second, third, fourth, f32_input,
+            second_output, third_output, fourth_output, stream);
+    else
+        launch_q8_K_f32_triple<NS_Q6_K, 8, true, false>(
+            first, q8_input, first_output, second, third, fourth, f32_input,
+            second_output, third_output, fourth_output, stream);
+    return hip_result(hipGetLastError(), "launch mixed GDN projections", error);
+}
+
 bool gpu_gemv_q8_K_f32_pair_supported(const GpuTensor& first,
                                       const GpuTensor& second,
                                       const GpuTensor& third) {
@@ -2217,14 +2759,49 @@ bool gpu_gemv_q8_K_pair_activate_supported(const GpuTensor& first,
            !(first.type == NS_Q4_K && second.type == NS_Q4_K);
 }
 
+bool gpu_gemv_mixed_pair_activate_supported(const GpuTensor& first,
+                                            const GpuTensor& second) {
+    if (first.n_dims != 2 || second.n_dims != 2 || first.ne[0] != 5120 ||
+        second.ne[0] != first.ne[0] || first.ne[1] != 17408 ||
+        second.ne[1] != first.ne[1])
+        return false;
+    return (first.type == NS_IQ4_NL && second.type == NS_Q5_K) ||
+           (first.type == NS_Q6_K && second.type == NS_Q8_0);
+}
+
+bool gpu_gemv_mixed_pair_activate(
+    const GpuTensor& first, const GpuTensor& second,
+    const block_q8_K* q8_input, const float* f32_input, float* gate_output,
+    float* up_output, float* activated, block_q8_K* activated_q8,
+    int32_t* ready, hipStream_t stream, std::string* error) {
+    if (!gpu_gemv_mixed_pair_activate_supported(first, second) ||
+        !first.data || !second.data || !q8_input || !f32_input ||
+        !gate_output || !up_output || !activated_q8 || !ready || !stream) {
+        if (error) *error = "invalid heterogeneous FFN projection arguments";
+        return false;
+    }
+    if (first.type == NS_IQ4_NL) {
+        if (!initialize_iq_tables(error)) return false;
+        launch_mixed_pair_activate<NS_Q5_K, NS_IQ4_NL, false, true>(
+            first, second, q8_input, f32_input, gate_output, up_output,
+            activated, activated_q8, ready, stream);
+    } else {
+        launch_mixed_pair_activate<NS_Q6_K, NS_Q8_0, true, false>(
+            first, second, q8_input, f32_input, gate_output, up_output,
+            activated, activated_q8, ready, stream);
+    }
+    return hip_result(hipGetLastError(),
+                      "launch heterogeneous FFN projections", error);
+}
+
 bool gpu_gemv_q8_K_pair_activate(
     const GpuTensor& first, const GpuTensor& second, const block_q8_K* input,
     float* gate_output, float* up_output, float* activated,
     block_q8_K* activated_q8, int32_t* ready, hipStream_t stream,
     std::string* error) {
     if (!gpu_gemv_q8_K_pair_activate_supported(first, second) || !first.data ||
-        !second.data || !input || !gate_output || !up_output || !activated ||
-        !activated_q8 || !ready || !stream) {
+        !second.data || !input || !gate_output || !up_output || !activated_q8 ||
+        !ready || !stream) {
         if (error) *error = "invalid fused FFN projection/activation arguments";
         return false;
     }
@@ -2440,7 +3017,7 @@ bool gpu_gemv_q8_K_add_norm(
     const float* norm_weight, float* normalized, block_q8_K* normalized_q8,
     int32_t* ready, float epsilon, hipStream_t stream, std::string* error) {
     if (!gpu_gemv_q8_K_add_norm_supported(tensor) || !tensor.data || !input ||
-        !destination || !norm_weight || !normalized || !normalized_q8 || !ready ||
+        !destination || !norm_weight || !normalized_q8 || !ready ||
         epsilon < 0.0f || !stream) {
         if (error) *error = "invalid fused residual GEMV/RMSNorm arguments";
         return false;

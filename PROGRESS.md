@@ -1713,3 +1713,99 @@ None remain in the tree.
 and the two Q8_0-gate GDN projection fallbacks as the best remaining evidence-led
 targets. Then rerun formal Q4/Q5 depth 0, complete G2a's Q5 oracle/256-token greedy
 sweeps, and run depth 32768 before entering Stage 3.
+
+---
+
+## 2026-08-24 — Session 15 (Stage 2 G2b checkpoint: both depth-0 gates green, GPT-5.6 Sol)
+
+**Task 7 and G2 remain open.** Both formal depth-0 throughput gates are now green:
+Q5 reached **30.004 ± 0.002 t/s** and Q4 reached **34.564 ± 0.004 t/s**. G2a's
+Q5 oracle/greedy checks and G2b's depth-32768 measurements remain before Stage 3.
+
+### 1. Exact dispatch and store elimination
+
+- GDN now reduces each 128-value head to a deterministic maximum summary before
+  the adjacent-head completion hand-off. The owner combines two summaries, emits
+  the exact 256-value Q8_K block, and resets the stream-ordered counter without a
+  redundant 512-thread tail barrier. Honest K2 measurement after restoring the
+  accepted form was **13.82 ± 0.20 us**.
+- The exceptional GDN layout fuses its integer qkv projection with the Q8_0 gate
+  and two fp32-input scalar projections. Compatible heterogeneous FFN gate/up
+  layouts likewise fuse projection, exact SiLU×up, and Q8_K quantization.
+- Attention Q/K use the existing compatible pair path when V differs. The blessed
+  Q/K/V type triples use one specialized dispatch while retaining each tensor's
+  standalone split and accumulation order, including mixed integer/fp32-input V.
+- Standalone RMSNorm and fused residual+RMSNorm omit their fp32 output when all
+  consumers use Q8_K. Fused FFN activation kernels are compile-time specialized
+  to omit the fp32 activated store when the down projection consumes Q8_K.
+- The deterministic generic Q8_K reducer now carries only the selected signed
+  winner from each wave through LDS. Its magnitude and global tie index are
+  derivable during the fixed wave-order reduction, eliminating two shared arrays.
+
+The final executable graphs are **324 nodes per parity for Q5** and **346 for
+Q4**, down from 341/364 at the previous checkpoint and 1,141 before task 7.
+
+### 2. Formal G2b depth-0 measurements
+
+The Q5 decode step streams **19.47 GB**, satisfying the >1 GB working-set rule.
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl /tmp/ns-q5-session15-formal-5.jsonl
+
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl /tmp/ns-q4-session15-formal.jsonl
+```
+
+| model | run t/s | mean ± population SD | ms/token | G2b depth-0 |
+|---|---|---:|---:|---|
+| Q5_K_XL | 30.006, 30.005, 30.002 | **30.004 ± 0.002** | **33.328** | **GREEN** |
+| Q4_K_XL | 34.567, 34.566, 34.559 | **34.564 ± 0.004** | **28.932** | **GREEN** |
+
+### 3. Correctness and regression verification
+
+```bash
+git diff --check
+make -j4 test
+ns_p1_tokens=$(<tests/prompts/p1.tokens)
+./build/release/ns gpu-eval \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --tokens "$ns_p1_tokens" --ctx 64 --topk 1 \
+  --dump-logits /tmp/ns-q4-p1-session15.bin
+sha256sum /tmp/ns-q4-p1-session15.bin
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS. The
+GEMV test covers **42 real cases, 4,464,225,280 weight bytes, and 4,421,396
+checks**; it now compares every supported three-projection fusion directly against
+three standalone GPU results for both blessed models. The 31-position Q4 recurrent
+fp32-logit hash remains byte-identical:
+
+```text
+0b9507a344459877cf89f2be367bc0976359c0092bf80eeb2819f665fe4776e9
+```
+
+Every HIP compile line used `--offload-arch=gfx1201` exactly.
+
+### 4. Measured rejects (all rolled back)
+
+Rejected variants included: 32-workgroup GDN q/k reuse (K2 15.32 vs 13.77 us);
+Q5 outer/pair-plane/item unroll and auxiliary prefetch forms; Q5 pair unroll-2
+(138 to 91 VGPR but slower); Q5 launch-bound and compatible-pair split changes;
+Q6 inner serialization and non-temporal main loads; ten-workgroup two-block norm
+tails; atomic-load norm polling; Q8_0 16-byte, four-byte packed, and partial-unroll
+loads; optional attention fp32 output plus signed-winner carry; and a GDN 128-VGPR
+form that spilled. Exact or buildable variants measured between **28.676 and
+29.938 t/s** against contemporaneous baselines up to **29.978 t/s**. The Q8_0
+16-byte variant stalled the forward test, was terminated and reverted, and the GPU
+recovered cleanly. None remain in the tree.
+
+**NEXT:** Complete G2a: run the full Q5 oracle sweep and 256-token greedy checks
+for both blessed files. Then run formal depth-32768 G2b throughput measurements.
+Do not begin Stage 3 until all G2 acceptance conditions are green.

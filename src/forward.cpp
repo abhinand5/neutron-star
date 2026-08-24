@@ -376,8 +376,7 @@ struct GpuEngine::Impl {
         offsets.ffn_activated = plan.take<float>(config.n_ff);
         offsets.logits = plan.take<float>(config.n_vocab);
         offsets.step_control = plan.take<int32_t>(3);
-        offsets.gdn_q8_ready =
-            plan.take<int32_t>(config.ssm_inner_size / QK_K);
+        offsets.gdn_q8_ready = plan.take<int32_t>(GDN_Q8_READY_INTS);
         offsets.ffn_q8_ready = plan.take<int32_t>(config.n_ff / QK_K);
         offsets.residual_norm_ready = plan.take<int32_t>(2);
 
@@ -491,7 +490,7 @@ struct GpuEngine::Impl {
                         "clear GDN state", error) ||
             !hip_result(hipMemsetAsync(
                             buffers.gdn_q8_ready, 0,
-                            (config.ssm_inner_size / QK_K) * sizeof(int32_t),
+                            GDN_Q8_READY_INTS * sizeof(int32_t),
                             stream),
                         "clear GDN Q8 readiness", error) ||
             !hip_result(hipMemsetAsync(
@@ -673,17 +672,29 @@ struct GpuEngine::Impl {
         for (uint32_t layer = 0; layer < config.n_layer_main; layer++) {
             const GpuLayerWeights& item = layers[layer];
             if (!attention_norm_ready) {
+                float* attention_normalized_output = buffers.normalized;
+                if (options.integer_gemv && item.is_attention &&
+                    has_vec_dot_q8_K(item.attn_q->type) &&
+                    has_vec_dot_q8_K(item.attn_k->type) &&
+                    has_vec_dot_q8_K(item.attn_v->type))
+                    attention_normalized_output = nullptr;
                 if (!profile_begin(item.is_attention ? "A1a norm+Q8"
                                                      : "K1a norm+Q8",
                                    &profile_record, error)) return false;
                 if (!normalize(buffers.hidden, f32_data(item.attn_norm),
-                               buffers.normalized, config.n_embd, error))
+                               attention_normalized_output, config.n_embd,
+                               error))
                     return set_layer_error(layer, "attention norm/quantize", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "attention norm profile", error);
             }
             attention_norm_ready = false;
             bool post_norm_ready = false;
+            float* const ffn_normalized_output =
+                options.integer_gemv &&
+                        has_vec_dot_q8_K(item.ffn_gate->type) &&
+                        has_vec_dot_q8_K(item.ffn_up->type)
+                    ? nullptr : buffers.normalized;
 
             if (item.is_attention) {
                 if (!profile_begin("A1b qkv projections", &profile_record, error))
@@ -696,6 +707,23 @@ struct GpuEngine::Impl {
                         *item.attn_q, buffers.q8, buffers.qg, *item.attn_k,
                         *item.attn_v, buffers.normalized, buffers.key,
                         buffers.value, stream, error);
+                else if (options.integer_gemv &&
+                         gpu_gemv_q8_K_triple_supported(
+                             *item.attn_q, *item.attn_k, *item.attn_v))
+                    projected = gpu_gemv_q8_K_triple(
+                        *item.attn_q, *item.attn_k, *item.attn_v, buffers.q8,
+                        buffers.normalized, buffers.qg, buffers.key,
+                        buffers.value, stream, error);
+                else if (options.integer_gemv &&
+                         gpu_gemv_q8_K_pair_supported(*item.attn_q,
+                                                      *item.attn_k) &&
+                         item.attn_q->type != item.attn_v->type &&
+                         item.attn_k->type != item.attn_v->type)
+                    projected = gemv_pair(item.attn_q, item.attn_k,
+                                          buffers.normalized, buffers.qg,
+                                          buffers.key, error) &&
+                                gemv(item.attn_v, buffers.normalized,
+                                     buffers.value, error);
                 else if (item.attn_q->type == item.attn_k->type)
                     projected = gemv_pair(item.attn_q, item.attn_k,
                                           buffers.normalized, buffers.qg,
@@ -760,13 +788,14 @@ struct GpuEngine::Impl {
                 const bool output_ok = q8_post_norm
                     ? gpu_gemv_q8_K_add_norm(
                           *item.attn_out, buffers.q8, buffers.hidden,
-                          f32_data(item.post_attn_norm), buffers.normalized,
+                          f32_data(item.post_attn_norm), ffn_normalized_output,
                           buffers.q8, buffers.residual_norm_ready,
                           config.rms_eps, stream, error)
                     : f32_post_norm
                         ? gpu_gemv_f32_add_norm(
                               *item.attn_out, buffers.gated, buffers.hidden,
-                              f32_data(item.post_attn_norm), buffers.normalized,
+                              f32_data(item.post_attn_norm),
+                              ffn_normalized_output,
                               buffers.q8, buffers.residual_norm_ready,
                               config.rms_eps, stream, error)
                         : gemv_add(item.attn_out, buffers.gated,
@@ -776,23 +805,35 @@ struct GpuEngine::Impl {
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "A3 profile", error);
             } else {
-                const bool fused_projections = options.integer_gemv &&
+                const bool fused_quant_projections = options.integer_gemv &&
                     gpu_gemv_q8_K_pair_f32_pair_supported(
                         *item.attn_qkv, *item.attn_gate, *item.ssm_alpha,
                         *item.ssm_beta);
+                const bool fused_q8_gate = options.integer_gemv &&
+                    gpu_gemv_q8_K_f32_triple_supported(
+                        *item.attn_qkv, *item.attn_gate, *item.ssm_alpha,
+                        *item.ssm_beta);
+                const bool fused_projections =
+                    fused_quant_projections || fused_q8_gate;
                 if (!profile_begin(fused_projections ? "K1b all projections"
                                                      : "K1b qkv+gate",
                                    &profile_record, error))
                     return set_layer_error(layer, "K1b profile", error);
-                const bool projected = fused_projections
+                const bool projected = fused_quant_projections
                     ? gpu_gemv_q8_K_pair_f32_pair(
                           *item.attn_qkv, *item.attn_gate, buffers.q8,
                           buffers.gdn_mixed, buffers.gdn_z, *item.ssm_alpha,
                           *item.ssm_beta, buffers.normalized, buffers.alpha,
                           buffers.beta, stream, error)
-                    : gemv_pair(item.attn_qkv, item.attn_gate,
-                                buffers.normalized, buffers.gdn_mixed,
-                                buffers.gdn_z, error);
+                    : fused_q8_gate
+                        ? gpu_gemv_q8_K_f32_triple(
+                              *item.attn_qkv, buffers.q8, buffers.gdn_mixed,
+                              *item.attn_gate, *item.ssm_alpha, *item.ssm_beta,
+                              buffers.normalized, buffers.gdn_z, buffers.alpha,
+                              buffers.beta, stream, error)
+                        : gemv_pair(item.attn_qkv, item.attn_gate,
+                                    buffers.normalized, buffers.gdn_mixed,
+                                    buffers.gdn_z, error);
                 if (!projected)
                     return set_layer_error(layer, "GDN qkv/gate", error);
                 if (!profile_end(profile_record, error))
@@ -855,13 +896,14 @@ struct GpuEngine::Impl {
                 const bool output_ok = q8_post_norm
                     ? gpu_gemv_q8_K_add_norm(
                           *item.ssm_out, buffers.q8, buffers.hidden,
-                          f32_data(item.post_attn_norm), buffers.normalized,
+                          f32_data(item.post_attn_norm), ffn_normalized_output,
                           buffers.q8, buffers.residual_norm_ready,
                           config.rms_eps, stream, error)
                     : f32_post_norm
                         ? gpu_gemv_f32_add_norm(
                               *item.ssm_out, buffers.gated, buffers.hidden,
-                              f32_data(item.post_attn_norm), buffers.normalized,
+                              f32_data(item.post_attn_norm),
+                              ffn_normalized_output,
                               buffers.q8, buffers.residual_norm_ready,
                               config.rms_eps, stream, error)
                         : gemv_add(item.ssm_out, buffers.gated,
@@ -878,14 +920,22 @@ struct GpuEngine::Impl {
                                    &profile_record, error))
                     return set_layer_error(layer, "FFN norm profile", error);
                 if (!normalize(buffers.hidden, f32_data(item.post_attn_norm),
-                               buffers.normalized, config.n_embd, error))
+                               ffn_normalized_output, config.n_embd, error))
                     return set_layer_error(layer, "FFN norm/quantize", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "FFN norm profile", error);
             }
-            const bool fused_ffn_activation = options.integer_gemv &&
+            const bool fused_integer_ffn = options.integer_gemv &&
                 gpu_gemv_q8_K_pair_activate_supported(*item.ffn_gate,
                                                       *item.ffn_up);
+            const bool fused_mixed_ffn = options.integer_gemv &&
+                gpu_gemv_mixed_pair_activate_supported(*item.ffn_gate,
+                                                       *item.ffn_up);
+            const bool fused_ffn_activation =
+                fused_integer_ffn || fused_mixed_ffn;
+            float* const activated_output =
+                has_vec_dot_q8_K(item.ffn_down->type)
+                    ? nullptr : buffers.ffn_activated;
             if (!profile_begin(
                     fused_ffn_activation
                         ? (item.is_attention ? "A4b FFN up+gate+SiLU+Q8"
@@ -894,13 +944,19 @@ struct GpuEngine::Impl {
                                              : "K4b FFN up+gate"),
                                &profile_record, error))
                 return set_layer_error(layer, "FFN projection profile", error);
-            const bool ffn_projected = fused_ffn_activation
+            const bool ffn_projected = fused_integer_ffn
                 ? gpu_gemv_q8_K_pair_activate(
                       *item.ffn_gate, *item.ffn_up, buffers.q8,
-                      buffers.ffn_gate, buffers.ffn_up, buffers.ffn_activated,
+                      buffers.ffn_gate, buffers.ffn_up, activated_output,
                       buffers.ffn_q8, buffers.ffn_q8_ready, stream, error)
-                : gemv_pair(item.ffn_gate, item.ffn_up, buffers.normalized,
-                            buffers.ffn_gate, buffers.ffn_up, error);
+                : fused_mixed_ffn
+                    ? gpu_gemv_mixed_pair_activate(
+                          *item.ffn_gate, *item.ffn_up, buffers.q8,
+                          buffers.normalized, buffers.ffn_gate, buffers.ffn_up,
+                          activated_output, buffers.ffn_q8,
+                          buffers.ffn_q8_ready, stream, error)
+                    : gemv_pair(item.ffn_gate, item.ffn_up, buffers.normalized,
+                                buffers.ffn_gate, buffers.ffn_up, error);
             if (!ffn_projected)
                 return set_layer_error(layer, "FFN up/gate", error);
             if (!profile_end(profile_record, error))

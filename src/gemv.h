@@ -62,6 +62,13 @@ bool gpu_gemv_q8_K_pair_activate(
     float* gate_output, float* up_output, float* activated,
     block_q8_K* activated_q8, int32_t* ready, hipStream_t stream,
     std::string* error = nullptr);
+bool gpu_gemv_mixed_pair_activate_supported(const GpuTensor& first,
+                                            const GpuTensor& second);
+bool gpu_gemv_mixed_pair_activate(
+    const GpuTensor& first, const GpuTensor& second,
+    const block_q8_K* q8_input, const float* f32_input, float* gate_output,
+    float* up_output, float* activated, block_q8_K* activated_q8,
+    int32_t* ready, hipStream_t stream, std::string* error = nullptr);
 bool gpu_gemv_q8_K_pair_f32_pair_supported(const GpuTensor& first,
                                            const GpuTensor& second,
                                            const GpuTensor& third,
@@ -70,6 +77,15 @@ bool gpu_gemv_q8_K_pair_f32_pair(
     const GpuTensor& first, const GpuTensor& second, const block_q8_K* q8_input,
     float* first_output, float* second_output, const GpuTensor& third,
     const GpuTensor& fourth, const float* f32_input, float* third_output,
+    float* fourth_output, hipStream_t stream, std::string* error = nullptr);
+bool gpu_gemv_q8_K_f32_triple_supported(const GpuTensor& first,
+                                        const GpuTensor& second,
+                                        const GpuTensor& third,
+                                        const GpuTensor& fourth);
+bool gpu_gemv_q8_K_f32_triple(
+    const GpuTensor& first, const block_q8_K* q8_input, float* first_output,
+    const GpuTensor& second, const GpuTensor& third, const GpuTensor& fourth,
+    const float* f32_input, float* second_output, float* third_output,
     float* fourth_output, hipStream_t stream, std::string* error = nullptr);
 bool gpu_gemv_q8_K_f32_pair_supported(const GpuTensor& first,
                                       const GpuTensor& second,
@@ -81,6 +97,14 @@ bool gpu_gemv_q8_K_f32_pair(
     std::string* error = nullptr);
 bool gpu_gemv_q8_K_pair_supported(const GpuTensor& first,
                                   const GpuTensor& second);
+bool gpu_gemv_q8_K_triple_supported(const GpuTensor& first,
+                                    const GpuTensor& second,
+                                    const GpuTensor& third);
+bool gpu_gemv_q8_K_triple(
+    const GpuTensor& first, const GpuTensor& second, const GpuTensor& third,
+    const block_q8_K* input, const float* f32_input, float* first_output,
+    float* second_output, float* third_output, hipStream_t stream,
+    std::string* error = nullptr);
 bool gpu_gemv_q8_K_add(const GpuTensor& tensor, const block_q8_K* input,
                        float* destination, hipStream_t stream,
                        std::string* error = nullptr);
