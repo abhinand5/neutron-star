@@ -3033,7 +3033,7 @@ bool gpu_gemv_q8_K_add_norm(
     switch (tensor.type) {
         case NS_Q3_K:   ADD_NORM(NS_Q3_K, 8, false, false); break;
         case NS_Q4_K:   ADD_NORM(NS_Q4_K, 4, false, false); break;
-        case NS_Q5_K:   ADD_NORM(NS_Q5_K, 4, false, false); break;
+        case NS_Q5_K:   ADD_NORM(NS_Q5_K, 8, false, false); break;
         case NS_Q6_K:   ADD_NORM(NS_Q6_K, 4, false, false); break;
         case NS_IQ4_XS: ADD_NORM(NS_IQ4_XS, 8, false, false); break;
         case NS_IQ3_S:  ADD_NORM(NS_IQ3_S, 8, false, false); break;

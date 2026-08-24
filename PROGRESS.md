@@ -2202,3 +2202,138 @@ drift from layer 0, not an isolated bad operator. The preserved complete-path
 failure remains: ns matches llama-step for 96 tokens, then crosses a near-tie;
 it matches llama-batch only through token 0. Per the two-session rule, do not spend
 another session on blind arithmetic variants. Do not enter Stage 3 while G2a is red.
+
+---
+
+## 2026-08-25 — Session 19 (Stage 2 G2a Q5 reduction localization, GPT-5.6 Sol)
+
+**G2a remains red, but the Q5 failure is substantially narrower.** The fused Q5_K
+FFN-down residual projection now uses eight K partitions instead of four. This one
+line makes the complete 205-row Q5 teacher sweep green, improves the p1 greedy
+match from a 96-token llama-step prefix to a 166-token llama-batch prefix, and
+slightly improves formal throughput. The exact 256-token continuation still forks,
+so Stage 3 remains blocked.
+
+### 1. GDN-side activation trace
+
+The GPU activation diagnostic now records `final_output-N` immediately after GDN
+K2 as well as `l_out-N`. This gives the same 112 ordered tensor names as the pinned
+llama.cpp callback on the 48 GDN / 16 attention layer topology.
+
+```bash
+./build/release/ns gpu-eval MODEL \
+  --tokens "$(cat ~/.cache/neutron-star/g2a-q5-divergence/shared-13.tokens)" \
+  --ctx 256 --topk 5 --debug-pos 12 \
+  --dump-activations /tmp/ns-q5-split8-pos12-act.bin
+python3 tools/compare_activations.py \
+  /tmp/ns-q5-split8-pos12-act.bin \
+  ~/.cache/neutron-star/g2a-q5-divergence/shared-13-step-act.bin
+```
+
+`final_output-0` is **0.99999999 cosine / 0.000236019 max difference** and
+`l_out-0` is **0.99999206 / 0.0362873**. The diagnostic 0.9999 marker first occurs
+at `final_output-1` (**0.99974092 / 0.00845961**); the trace then drifts smoothly to
+`l_out-63` at **0.99963633 / 3.28807**. GDN's first output is therefore essentially
+identical and there is still no structural discontinuity.
+
+### 2. Q5 fused residual reduction
+
+The pinned x86 Q5_K x Q8_K path retains eight fp32 accumulator lanes. Production
+had used four K partitions only for the fused Q5 down-projection/add/RMSNorm path.
+Changing that dispatch to eight partitions produced the following exact shared
+position result:
+
+| engine | token 11 | token 579 | winner |
+|---|---:|---:|---|
+| llama CPU stepwise | 18.9493 | 18.9415 | 11 |
+| ns Q5 split-4 | 18.9233 | 18.9851 | 579 |
+| ns Q5 split-8 | 18.9969 | 18.9914 | 11 |
+
+The formal teacher-forced sweep used the unchanged D6/D8/D9 harness:
+
+```bash
+D=$HOME/.cache/neutron-star/parity-205-q5
+python3 tools/compare.py /tmp/ns-q5-split8-p1.bin "$D/p1_ref_step.bin" \
+  --control "$D/p1_ref_batch.bin" --case-label p1 \
+  --case p2 /tmp/ns-q5-split8-p2.bin "$D/p2_ref_step.bin" "$D/p2_ref_batch.bin" \
+  --case p3 /tmp/ns-q5-split8-p3.bin "$D/p3_ref_step.bin" "$D/p3_ref_batch.bin" \
+  --case p4 /tmp/ns-q5-split8-p4.bin "$D/p4_ref_step.bin" "$D/p4_ref_batch.bin" \
+  --vocab 248320 --guard-side ns \
+  --label "G2a Q5 split8 teacher-forced logits"
+```
+
+| prompt | rows | raw top-1 | triangulated | ns worst cosine | control worst |
+|---|---:|---:|---:|---:|---:|
+| p1 | 31 | 30/31 | 31/31 | 0.99951971 | 0.99947041 |
+| p2 | 90 | 90/90 | 90/90 | **0.99716446** | 0.91065207 |
+| p3 | 54 | 53/54 | 54/54 | 0.99828468 | 0.99782369 |
+| p4 | 30 | 30/30 | 30/30 | 0.99839719 | 0.99955665 |
+| **total** | **205** | **203/205** | **205/205** | **0.99716446** | **0.91065207** |
+
+Aggregate mean cosine is **0.99960868** and top-5 overlap is **0.9727**. This is
+GREEN and removes the old p2 cosine failure of 0.90784900.
+
+The full autoregressive check remains RED:
+
+```bash
+./build/release/ns gpu-eval MODEL --tokens "$P1_FIRST_12" --ctx 272 \
+  --generate 256 --dump-tokens /tmp/ns-q5-split8-greedy256.bin
+python3 tools/compare_tokens.py /tmp/ns-q5-split8-greedy256.bin \
+  ~/.cache/neutron-star/greedy-256-q5/p1_ref_step.bin \
+  ~/.cache/neutron-star/greedy-256-q5/p1_ref_batch.bin \
+  --min-tokens 256 --label "G2a Q5 split8 p1 greedy continuation"
+```
+
+It differs from llama-step at generation 1 because it follows llama-batch, then
+matches the complete llama-batch path through generation 165 and forks at 166:
+ns chooses token 4204 at **21.8426**, while a fresh real batched-prefill/step-decode
+oracle replay chooses token 7752 at **21.8290**. The result is not reinterpreted:
+**166/256 is progress, not a green exact-continuation gate.**
+
+### 3. Performance and rejected arithmetic variants
+
+```bash
+./build/release/ns bench MODEL --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl /tmp/ns-q5-split8-session19-formal.jsonl
+```
+
+Runs were **30.014, 30.012, 30.008 t/s**, or **30.011 ± 0.002 t/s /
+33.321 ms/token**. This is green and slightly above Session 18's
+30.003 ± 0.006 baseline.
+
+All other bounded reduction-tree variants were rejected and completely rolled
+back:
+
+- A serial, exact AVX2-style Q5 accumulator extended GPU/cpu_ref greedy parity
+  from 9 to 45 tokens but regressed the llama-batch match from 166 to 9.
+- AVX2 ordering inside each block while retaining split-8, contiguous K
+  partitions, and an AVX-style horizontal partial reduction all lost the
+  llama-batch path at generation 1.
+- Moving Q4_K or Q6_K fused residuals from four to eight partitions also lost at
+  generation 1.
+
+Only the Q5_K `4 -> 8` dispatch change remains.
+
+### 4. Verification and preserved evidence
+
+```bash
+git diff --check
+make -j4 test bench
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv` (4,464,225,280 weight bytes / 4,421,396 checks),
+`test_gpu_ops`, `test_gpu_upload`, `test_quants`, `test_repack`,
+`test_compare_gate.py`, and `test_compare_tokens.py` all PASS. Benchmark binaries
+build. Every HIP compile used `--offload-arch=gfx1201` exactly. Session artifacts
+are preserved at:
+
+```text
+~/.cache/neutron-star/g2a-q5-divergence/session19/
+```
+
+**NEXT / ESCALATE:** Keep G2a red and Stage 3 blocked. Extend the pinned oracle's
+existing eval callback so `--generate` can dump the actual generated-position
+logits/activations after batched prompt prefill, then bisect the shared generation-
+166 state against the GPU trace. Do not search reduction permutations or weaken
+the 256-token identity requirement.

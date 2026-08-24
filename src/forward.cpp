@@ -987,6 +987,9 @@ struct GpuEngine::Impl {
                     return set_layer_error(layer, "K2", error);
                 if (!profile_end(profile_record, error))
                     return set_layer_error(layer, "K2 profile", error);
+                if (!dump_activation("final_output", layer, buffers.gated,
+                                     config.ssm_inner_size, position, error))
+                    return set_layer_error(layer, "GDN activation dump", error);
                 if (!options.integer_gemv) {
                     if (!profile_begin("K3a output Q8", &profile_record, error))
                         return set_layer_error(layer, "K3a profile", error);
