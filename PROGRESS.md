@@ -2064,3 +2064,141 @@ and both Python gate suites passed. Every HIP compile line used
 **NEXT:** Keep Stage 2/G2 red. The performance work has cleared both 32K retention
 sub-gates, but Q5 needs a robust literal >=30 t/s depth-0 result and G2a's preserved
 exact-greedy/cosine repro remains escalated. Do not enter Stage 3.
+
+---
+
+## 2026-08-24 — Session 18 (Stage 2 G2a escalation audit; G2b green, GPT-5.6 Sol)
+
+**G2b is green; G2a remains red and Stage 3 remains blocked.** A fresh production
+Q5 depth-0 formal run measured **30.003 ± 0.006 t/s** without rounding any run
+upward. Together with Session 15's independent 30.004 result and Session 17's
+green Q4/Q5 32K retention results, this meets the literal performance gate. The
+remaining gate is correctness: Q5's complete 256-token path still matches neither
+llama.cpp CPU reference path, and its teacher-forced worst cosine remains below
+the self-calibrated control floor.
+
+### 1. Current production baseline and roofline
+
+```bash
+./build/release/ns bench \
+  ~/dev/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q5_K_XL.gguf \
+  --tokens 512 --reps 3 --warmup 8 --depth 0 \
+  --jsonl /tmp/ns-q5-session18-baseline.jsonl
+```
+
+```text
+run 1  30.007 t/s
+run 2  30.007 t/s
+run 3  29.995 t/s
+mean   30.003 ± 0.006 t/s, 33.330 ms/token — GREEN
+```
+
+The eager localization profile was **34,647.20 us**: K1 5,248.64 us, K2 987.58,
+K3 2,488.49, K4 10,190.78, K5 5,653.57, A1 1,526.23, A2 179.48, A3 859.70,
+A4 3,479.52, A5 1,879.68, and H2 2,121.97. At 19.433 GiB streamed per step,
+the formal graph run is already about **626 GB/s** against the measured 634.8
+GB/s / nominal 640 GB/s ceiling. No untried evidence-led 0.1 ms target remained;
+the performance result is close because the hardware roofline is close.
+
+G2b's final evidence is therefore:
+
+| model | depth 0 | depth 32768 | retention | verdict |
+|---|---:|---:|---:|---|
+| Q4_K_XL | 34.564 ± 0.004 | 30.478 ± 0.030 | 88.18% | GREEN |
+| Q5_K_XL | 30.003 ± 0.006 current (30.004 ± 0.002 independent) | 26.863 ± 0.014 | 89.53% | GREEN |
+
+### 2. Exact shared-prefix reconstruction
+
+The preserved greedy mismatch was reconstructed by feeding the first 12 p1 prompt
+tokens plus GPU generations 0..95 into both engines. At the next-token fork:
+
+| engine | token 53218 | token 3349 | winner |
+|---|---:|---:|---:|
+| ns GPU integer | 18.828274 | 18.679050 | 53218 by 0.149224 |
+| llama CPU stepwise | 18.652309 | 18.707972 | 3349 by 0.055662 |
+
+The complete logit rows have cosine **0.999769483** and max absolute difference
+**0.405917**. This is the original greedy fork at generation 96, reproduced on
+the current production code rather than inferred from two divergent contexts.
+
+The remaining unmatched numerical choice was KV precision. It was tested directly:
+
+```bash
+./build/release/tools/oracle_logits -m MODEL -t GPU_SHARED_PREFIX \
+  -o /tmp/ns-q5-step-shared-gen96.bin
+./build/release/tools/oracle_logits -m MODEL -t GPU_SHARED_PREFIX --kv-f16 \
+  -o /tmp/ns-q5-step-f16-shared-gen96.bin
+cmp /tmp/ns-q5-step-shared-gen96.bin \
+    /tmp/ns-q5-step-f16-shared-gen96.bin
+```
+
+Both 108-row files are bit-identical with SHA-256
+`2df1899ca90146881c2721c15a089a145641f897896916f502ed3e6b90ed48cf`.
+The fp16 GPU KV format is not the cause.
+
+### 3. GPU activation bisect
+
+`gpu-eval` now accepts `--debug-pos N --dump-activations FILE`. It forces eager
+execution only for that diagnostic run and writes the same NSAC records consumed
+by `tools/compare_activations.py`. Production graph capture and benchmark topology
+are unchanged. The first useful capture is deliberately small: one `l_out-N`
+record after each of the 64 layers.
+
+```bash
+./build/release/ns gpu-eval MODEL \
+  --tokens "$(cat ~/.cache/neutron-star/g2a-q5-divergence/shared-13.tokens)" \
+  --ctx 256 --topk 5 --debug-pos 12 \
+  --dump-activations /tmp/ns-q5-gpu-int-pos12-act.bin
+python3 tools/compare_activations.py \
+  /tmp/ns-q5-gpu-int-pos12-act.bin \
+  ~/.cache/neutron-star/g2a-q5-divergence/shared-13-cpu-ref-act.bin
+```
+
+The output contains 64 ordered, structurally valid NSAC records. Against the
+in-repo Q8_K CPU row oracle, integer GPU decode starts at **0.99999993 cosine /
+0.003008 max difference** after layer 0, drifts smoothly past the diagnostic
+0.9999 marker at layer 19, and ends at **0.99959457 / 4.72321** after layer 63.
+There is no discontinuous layer or structural signature. GPU fp32-dequant is less
+aligned early (0.99989417 by layer 2), confirming that the shipping integer path
+is the closer arithmetic. Traces and comparison logs are preserved at:
+
+```text
+~/.cache/neutron-star/g2a-q5-divergence/session18/
+```
+
+### 4. Q8_0 output-head hypothesis (rejected and rolled back)
+
+`output.weight` is Q8_0, while production uses its existing fp32-dequant head.
+A ggml-style Q8_0 activation plus signed-int dot was implemented as a
+diagnostic candidate, including ggml's eight-lane AVX2 accumulation tree.
+
+- The full Q5 teacher sweep moved worst cosine only from 0.90784900 to
+  **0.90787888**, still below the 0.91065207 control floor, and introduced one
+  additional admissible near-tie (204/205 triangulated instead of 205/205).
+- The generated path stayed byte-identical to current ns for its first 100 tokens
+  and therefore retained the generation-96 mismatch against llama-step.
+- Formal performance was **30.000 ± 0.002 t/s** (30.002, 30.000, 29.997), versus
+  the 30.003 production baseline.
+
+It did not resolve correctness or add performance margin, so every Q8_0-head
+change was rolled back. Current logits at the 13-token repro are restored exactly:
+token 579 at 18.9851 versus token 11 at 18.9233, with a 324-node graph.
+
+### 5. Verification
+
+```bash
+git diff --check
+make -j4 test
+```
+
+No whitespace errors. `test_gguf`, `test_gpu_attention`, `test_gpu_forward`,
+`test_gpu_gdn`, `test_gpu_gemv`, `test_gpu_ops`, `test_gpu_upload`, `test_quants`,
+`test_repack`, `test_compare_gate.py`, and `test_compare_tokens.py` all PASS.
+Every HIP compile used `--offload-arch=gfx1201` exactly.
+
+**NEXT / ESCALATE:** G2a is still the sole red Stage-2 condition. The new evidence
+rules out fp16 KV and the Q8_0 head and shows smooth cross-backend accumulation
+drift from layer 0, not an isolated bad operator. The preserved complete-path
+failure remains: ns matches llama-step for 96 tokens, then crosses a near-tie;
+it matches llama-batch only through token 0. Per the two-session rule, do not spend
+another session on blind arithmetic variants. Do not enter Stage 3 while G2a is red.

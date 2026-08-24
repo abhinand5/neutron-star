@@ -56,6 +56,7 @@ static int usage() {
             "           [--all-pos] [--dump-logits FILE] [--generate N]\n"
             "           [--dump-tokens FILE] [--ctx N] [--fp32-gemv]\n"
             "           [--no-graph] [--profile]\n"
+            "           [--debug-pos N --dump-activations FILE]\n"
             "  runs the eager gfx1201 decode engine. Integer Q8_K GEMV is the\n"
             "  default; --fp32-gemv selects the dequant-and-FMA diagnostic path.\n");
     fprintf(stderr,
@@ -175,7 +176,9 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
                         int topk, bool all_pos, const std::string& dump_path,
                         int generate, const std::string& token_path,
                         int requested_context, bool fp32_gemv,
-                        bool allow_display, bool no_graph, bool profile) {
+                        bool allow_display, bool no_graph, bool profile,
+                        int debug_position,
+                        const std::string& activation_path) {
     std::vector<int32_t> tokens = parse_tokens(tokens_csv);
     if (tokens.empty()) {
         fprintf(stderr, "ns: --tokens is empty\n");
@@ -188,8 +191,10 @@ static int cmd_gpu_eval(const std::string& path, const std::string& tokens_csv,
         ? requested_context : std::max(256, needed_context);
     options.allow_display = allow_display;
     options.integer_gemv = !fp32_gemv;
-    options.use_graph = !no_graph && !profile;
+    options.use_graph = !no_graph && !profile && activation_path.empty();
     options.profile = profile;
+    options.debug_position = debug_position;
+    options.activation_path = activation_path;
     if (options.max_context < needed_context) {
         fprintf(stderr, "ns: --ctx %d is smaller than the requested %d-token run\n",
                 options.max_context, needed_context);
@@ -573,10 +578,11 @@ int main(int argc, char** argv) {
     }
     if (cmd == "gpu-eval") {
         if (argc < 3) return usage();
-        std::string tokens, dump, token_dump;
+        std::string tokens, dump, token_dump, activation_path;
         int topk = 5;
         int generate = 0;
         int context = 0;
+        int debug_position = -1;
         bool all_pos = false;
         bool fp32_gemv = false;
         bool allow_display = false;
@@ -600,13 +606,18 @@ int main(int argc, char** argv) {
             else if (argument == "--allow-display") allow_display = true;
             else if (argument == "--no-graph") no_graph = true;
             else if (argument == "--profile") profile = true;
+            else if (argument == "--debug-pos" && index + 1 < argc)
+                debug_position = atoi(argv[++index]);
+            else if (argument == "--dump-activations" && index + 1 < argc)
+                activation_path = argv[++index];
             else return usage();
         }
         if (generate < 0 || context < 0 || topk <= 0 ||
-            (!token_dump.empty() && generate == 0)) return usage();
+            (!token_dump.empty() && generate == 0) ||
+            (activation_path.empty() != (debug_position < 0))) return usage();
         return cmd_gpu_eval(argv[2], tokens, topk, all_pos, dump, generate,
                             token_dump, context, fp32_gemv, allow_display,
-                            no_graph, profile);
+                            no_graph, profile, debug_position, activation_path);
     }
     if (cmd == "bench") {
         if (argc < 3) return usage();

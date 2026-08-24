@@ -203,13 +203,28 @@ struct GpuEngine::Impl {
     bool poisoned = false;
     int32_t* host_step_control = nullptr;
     float* host_logits_staging = nullptr;
+    FILE* activation_file = nullptr;
+    uint32_t activation_count = 0;
+    std::vector<float> activation_staging;
     hipGraphExec_t graph_exec[2] = {nullptr, nullptr};
     std::vector<PendingProfile> pending_profile;
     std::vector<GpuProfileEntry> last_profile;
 
     ~Impl() { clear_runtime(); }
 
+    void close_activation_file() {
+        if (!activation_file) return;
+        if (fseek(activation_file, 4, SEEK_SET) == 0)
+            fwrite(&activation_count, sizeof(activation_count), 1,
+                   activation_file);
+        fclose(activation_file);
+        activation_file = nullptr;
+        activation_count = 0;
+        activation_staging.clear();
+    }
+
     void clear_runtime() {
+        close_activation_file();
         clear_pending_profile();
         for (hipGraphExec_t& executable : graph_exec) {
             if (executable) {
@@ -243,6 +258,59 @@ struct GpuEngine::Impl {
         conv_bank_b = false;
         poisoned = false;
         last_profile.clear();
+    }
+
+    bool open_activation_file(std::string* error) {
+        if (options.activation_path.empty()) return true;
+        activation_file = fopen(options.activation_path.c_str(), "wb");
+        const uint32_t placeholder = 0;
+        if (!activation_file ||
+            fwrite("NSAC", 1, 4, activation_file) != 4 ||
+            fwrite(&placeholder, sizeof(placeholder), 1, activation_file) != 1) {
+            if (error)
+                *error = "cannot create GPU activation dump '" +
+                         options.activation_path + "'";
+            if (activation_file) fclose(activation_file);
+            activation_file = nullptr;
+            return false;
+        }
+        activation_count = 0;
+        return true;
+    }
+
+    bool dump_activation(const char* what, uint32_t layer,
+                         const float* device_values, size_t elements,
+                         int32_t position, std::string* error) {
+        if (!activation_file || position != options.debug_position) return true;
+        activation_staging.resize(elements);
+        const hipStream_t stream = weights.stream();
+        if (!hip_result(
+                hipMemcpyAsync(activation_staging.data(), device_values,
+                               elements * sizeof(float), hipMemcpyDeviceToHost,
+                               stream),
+                "copy GPU debug activation", error) ||
+            !hip_result(hipStreamSynchronize(stream),
+                        "synchronize GPU debug activation", error))
+            return false;
+        char name[64];
+        const int length = snprintf(name, sizeof(name), "%s-%u", what, layer);
+        if (length <= 0 || (size_t)length >= sizeof(name)) {
+            if (error) *error = "GPU debug activation name is too long";
+            return false;
+        }
+        const uint32_t name_length = (uint32_t)length;
+        const uint64_t element_count = (uint64_t)elements;
+        if (fwrite(&name_length, sizeof(name_length), 1, activation_file) != 1 ||
+            fwrite(name, 1, name_length, activation_file) != name_length ||
+            fwrite(&element_count, sizeof(element_count), 1,
+                   activation_file) != 1 ||
+            fwrite(activation_staging.data(), sizeof(float), elements,
+                   activation_file) != elements) {
+            if (error) *error = "cannot write GPU activation dump";
+            return false;
+        }
+        activation_count++;
+        return true;
     }
 
     void clear_pending_profile() {
@@ -1044,6 +1112,9 @@ struct GpuEngine::Impl {
             }
             if (!profile_end(profile_record, error))
                 return set_layer_error(layer, "FFN stage 5 profile", error);
+            if (!dump_activation("l_out", layer, buffers.hidden,
+                                 config.n_embd, position, error))
+                return set_layer_error(layer, "activation dump", error);
         }
 
         if (!final_norm_ready) {
@@ -1221,10 +1292,18 @@ bool GpuEngine::load(const std::string& path, const GpuEngineOptions& options,
         if (error) *error = "profiling requires eager mode (set use_graph=false)";
         return false;
     }
+    if ((!options.activation_path.empty() && options.debug_position < 0) ||
+        (options.activation_path.empty() && options.debug_position >= 0) ||
+        (!options.activation_path.empty() && options.use_graph)) {
+        if (error)
+            *error = "GPU activation capture requires a path, nonnegative "
+                     "debug position, and eager mode";
+        return false;
+    }
     impl_->options = options;
     if (!impl_->weights.load(path, options.allow_display, false, error) ||
         !gpu_prepare_gemv(error) || !impl_->resolve_weights(error) ||
-        !impl_->allocate_runtime(error)) {
+        !impl_->allocate_runtime(error) || !impl_->open_activation_file(error)) {
         impl_->clear_runtime();
         impl_->weights.reset();
         return false;

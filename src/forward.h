@@ -18,6 +18,8 @@ struct GpuEngineOptions {
     bool integer_gemv = true;
     bool use_graph = true;
     bool profile = false;
+    int debug_position = -1;
+    std::string activation_path;
 };
 
 struct GpuProfileEntry {
